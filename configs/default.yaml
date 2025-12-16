@@ -78,10 +78,5 @@ experiment:
     - "total_migration_time_us"
     - "migration_time_us_per_query"
 
-  workload: "uniform"
-  workload_zipf_s: 1.2
-  workload_hot_frac: 0.05
-  workload_hot_prob: 0.8
-  workload_shift_interval: 10000
-
+  workload: "default"
   workload_num_requests: 20000   # If it used to be on the order of 200000, it can be cut down to 20k

@@ -40,9 +40,9 @@ The goal is to understand:
 
   With a simple page-latency model:
 
-$$
-t_{\text{page}} = 20 + \frac{10^6}{\text{max\_iops}} \ \text{µs}
-$$
+  ```math
+  t_{\text{page}} = 20 + \frac{10^6}{\text{max\_iops}} \ \text{µs}
+  ```
 
 
 * **Multiple caching policies at IVF-list granularity**
