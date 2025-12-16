@@ -73,12 +73,20 @@ class PolicyConfig:
     seconds_rule: SecondsRuleConfig
 
 
-@dataclass(frozen=True)
+@dataclass
 class ExperimentConfig:
     seeds: List[int]
     slas_us: List[float]
     export_metrics: List[str]
 
+    workload: str = "uniform"
+
+    workload_zipf_s: float = 1.2
+    workload_hot_frac: float = 0.05
+    workload_hot_prob: float = 0.8
+    workload_shift_interval: int = 10_000
+
+    workload_num_requests: int | None = None
 
 @dataclass(frozen=True)
 class PlotConfig:

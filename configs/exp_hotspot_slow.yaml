@@ -1,12 +1,12 @@
 project:
   results_root: "results"
-  run_name: "sr_sift_default_fast"
+  run_name: "sr_sift_exp_hotspot_slow_fast"
 
 data:
   dataset: "sift1m"
   sift1m_dir: "data/sift1m"
-  num_base: 20000          # Originally 100000 → directly cut down to 20k
-  num_queries: 2000        # Originally 10000 → cut down to 2000
+  num_base: 100000
+  num_queries: 1000
   dim: 128
   query_shuffle: true
   query_sample_without_replacement: true
@@ -16,7 +16,7 @@ index:
   metric: "l2"
   k: 10
   nlist: 64
-  nprobe_candidates: [1, 4, 16]   # Removed 2/8/32, keep only three points: small/medium/large
+  nprobe_candidates: [1, 2, 4, 8, 16, 32]
   faiss_num_threads: 4
   train_seed: 1234
 
@@ -24,8 +24,8 @@ tier:
   page_size_bytes: 4096
   dram_access_us_per_list: 0.2
   ssd_base_lat_us_per_page: 20.0
-  dram_fraction_list: [0.05, 0.2]   # Only look at two points: “very tight” and “relatively loose”
-  max_iops_list: [1000000, 5000000] # Keep only the 1M and 5M tiers
+  dram_fraction_list: [0.05, 0.1, 0.2]
+  max_iops_list: [5000000]
   migration_count_eviction: true
 
 policy:
@@ -53,16 +53,14 @@ plot:
   errorbar: "ci95"
   figures:
     - "p95_vs_dram"
-    - "p95_vs_iops"
     - "io_amp_vs_dram"
     - "migration_vs_dram"
     - "sla_reachable_recall"
     - "recall_latency_frontier"
 
 experiment:
-  seeds: [0]                  # Single seed is enough to see trends
+  seeds: [0, 1, 2]
   slas_us: [200.0, 500.0]
-
   export_metrics:
     - "avg_latency_us"
     - "p50_latency_us"
@@ -78,10 +76,8 @@ experiment:
     - "total_migration_time_us"
     - "migration_time_us_per_query"
 
-  workload: "uniform"
-  workload_zipf_s: 1.2
+  workload: "hotspot"
   workload_hot_frac: 0.05
   workload_hot_prob: 0.8
-  workload_shift_interval: 10000
-
-  workload_num_requests: 20000   # If it used to be on the order of 200000, it can be cut down to 20k
+  workload_shift_interval: 20000
+  workload_num_requests: 50000

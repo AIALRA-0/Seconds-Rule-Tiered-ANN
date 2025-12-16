@@ -1,12 +1,14 @@
 project:
   results_root: "results"
-  run_name: "sr_sift_default_fast"
+  run_name: "sr_sift_exp_uniform_fast"   # Change the name to avoid overwrite
 
 data:
   dataset: "sift1m"
   sift1m_dir: "data/sift1m"
-  num_base: 20000          # Originally 100000 → directly cut down to 20k
-  num_queries: 2000        # Originally 10000 → cut down to 2000
+
+  # Also reduce a bit here; still enough to see trends
+  num_base: 50000          # Previously 100000
+  num_queries: 500         # Previously 1000
   dim: 128
   query_shuffle: true
   query_sample_without_replacement: true
@@ -16,7 +18,10 @@ index:
   metric: "l2"
   k: 10
   nlist: 64
-  nprobe_candidates: [1, 4, 16]   # Removed 2/8/32, keep only three points: small/medium/large
+
+  # Keep only 3 nprobes, roughly covering small / medium / large
+  nprobe_candidates: [1, 2, 4, 8, 16, 32]   # Previously [1, 2, 4, 8, 16, 32]
+
   faiss_num_threads: 4
   train_seed: 1234
 
@@ -24,8 +29,13 @@ tier:
   page_size_bytes: 4096
   dram_access_us_per_list: 0.2
   ssd_base_lat_us_per_page: 20.0
-  dram_fraction_list: [0.05, 0.2]   # Only look at two points: “very tight” and “relatively loose”
-  max_iops_list: [1000000, 5000000] # Keep only the 1M and 5M tiers
+
+  # Two DRAM corner points are enough to see trends
+  dram_fraction_list: [0.05, 0.1, 0.2]          # Previously [0.05, 0.1, 0.2]
+
+  # Fix IOPS to a single (middle) value for now
+  max_iops_list: [5000000]                 # Previously [1000000, 5000000, 10000000]
+
   migration_count_eviction: true
 
 policy:
@@ -53,14 +63,14 @@ plot:
   errorbar: "ci95"
   figures:
     - "p95_vs_dram"
-    - "p95_vs_iops"
     - "io_amp_vs_dram"
     - "migration_vs_dram"
     - "sla_reachable_recall"
     - "recall_latency_frontier"
+    # Remove p95_vs_iops for now because IOPS has only one point, so the plot would not be very meaningful
 
 experiment:
-  seeds: [0]                  # Single seed is enough to see trends
+  seeds: [0, 1, 2]             # Single seed is enough
   slas_us: [200.0, 500.0]
 
   export_metrics:
@@ -79,9 +89,6 @@ experiment:
     - "migration_time_us_per_query"
 
   workload: "uniform"
-  workload_zipf_s: 1.2
-  workload_hot_frac: 0.05
-  workload_hot_prob: 0.8
-  workload_shift_interval: 10000
 
-  workload_num_requests: 20000   # If it used to be on the order of 200000, it can be cut down to 20k
+  # Lower the number of requests to around 20k–50k is sufficient
+  workload_num_requests: 20000    # Previously 200000

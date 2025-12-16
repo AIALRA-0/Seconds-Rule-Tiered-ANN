@@ -9,6 +9,7 @@ from .config import FullConfig
 from .latency_model import TierModelParams, migration_overhead_us, query_latency_us
 from .policies import build_policy
 from .utils import percentile
+from .workload import make_workload
 
 
 @dataclass
@@ -40,7 +41,9 @@ def _pages_for_list_bytes(list_bytes: np.ndarray, page_size: int) -> np.ndarray:
 def run_policies_on_queries(
     cfg: FullConfig,
     *,
-    query_list_ids: np.ndarray,   # (Q, nprobe)
+    # Here it is still interpreted as “the access results of the unique queries”, 
+    # and the request sequence is later generated using workload
+    query_list_ids: np.ndarray,   # (Q_unique, nprobe)
     avg_ann_us: float,
     recall_at_k: float,
     list_bytes: np.ndarray,       # (nlist,)
@@ -52,14 +55,83 @@ def run_policies_on_queries(
     For a fixed (nprobe, query_list_ids, avg_ann_us, tier params):
       - run multiple policies in parallel
       - output the metrics for each policy
+
+    Now supports cfg.experiment.workload:
+        - experiment.workload: "uniform" / "zipf" / "hotspot_shift"
+        - experiment.workload_zipf_s
+        - experiment.workload_hot_frac
+        - experiment.workload_hot_prob
+        - experiment.workload_shift_interval
+        - experiment.workload_num_requests
     """
-    Q, nprobe = query_list_ids.shape
+
+    # ------------------------------------------------
+    # 1) Basic info & workload configuration
+    # ------------------------------------------------
+    base_Q, nprobe = query_list_ids.shape
     k = cfg.index.k
 
+    exp_cfg = cfg.experiment
+
+    workload_kind = getattr(exp_cfg, "workload", "uniform").lower()
+    zipf_s = getattr(exp_cfg, "workload_zipf_s", 1.2)
+    hot_frac = getattr(exp_cfg, "workload_hot_frac", 0.05)
+    hot_prob = getattr(exp_cfg, "workload_hot_prob", 0.8)
+    shift_interval = getattr(exp_cfg, "workload_shift_interval", 10_000)
+    workload_num_requests = getattr(exp_cfg, "workload_num_requests", None)
+
+    # Generate request sequence: each element is a query index in [0, base_Q)
+    if workload_kind in ("uniform", "random", "iid"):
+        # uniform: default behavior same as older version, each query used once
+        if isinstance(workload_num_requests, int) and workload_num_requests > 0:
+            # If workload_num_requests is specified, simply reuse with round-robin
+            qids = np.arange(base_Q, dtype=np.int64)
+            if workload_num_requests <= base_Q:
+                request_query_ids = qids[:workload_num_requests]
+            else:
+                # np.resize will cycle-fill
+                request_query_ids = np.resize(qids, workload_num_requests)
+        else:
+            # If not specified, each query once
+            request_query_ids = np.arange(base_Q, dtype=np.int64)
+    else:
+        # Non-uniform: use Zipf / HotspotShiftWorkload to generate
+        num_requests = (
+            workload_num_requests
+            if isinstance(workload_num_requests, int) and workload_num_requests > 0
+            else base_Q
+        )
+
+        rng_seed = exp_cfg.seeds[0] if getattr(exp_cfg, "seeds", None) else 0
+        rng = np.random.default_rng(rng_seed)
+
+        workload = make_workload(
+            kind=workload_kind,
+            zipf_s=zipf_s,
+            hot_frac=hot_frac,
+            hot_prob=hot_prob,
+            shift_interval=shift_interval,
+        )
+        request_query_ids = workload.generate(
+            num_requests=num_requests,
+            num_queries=base_Q,
+            rng=rng,
+        )
+
+    # Actual number of requests participating in the policy simulation
+    Q = int(len(request_query_ids))
+    progress_step = max(Q // 10, 1)
+
+    # ------------------------------------------------
+    # 2) Pre-compute page / bytes for each IVF list
+    # ------------------------------------------------
     pages_per_list = _pages_for_list_bytes(list_bytes, tier.page_size_bytes)
     bytes_read_per_list = pages_per_list.astype(np.float64) * float(tier.page_size_bytes)
     list_bytes_list = list(list_bytes.astype(float))
 
+    # ------------------------------------------------
+    # 3) Build policy instances
+    # ------------------------------------------------
     enabled = cfg.policy.enabled_policies
     policies = {
         name: build_policy(
@@ -88,11 +160,22 @@ def run_policies_on_queries(
     migrated_time_us: Dict[str, float] = {p: 0.0 for p in policies}
     num_rebalances = 0
 
-    for qid in range(Q):
+    # ------------------------------------------------
+    # 4) Main loop: send queries according to workload order
+    #    t = “time step”, Seconds-Rule uses t for temporal logic
+    # ------------------------------------------------
+    for t in range(Q):
+        # Progress hint (print every 1/10 progress)
+        if (t + 1) % progress_step == 0 or (t + 1) == Q:
+            print(
+                f"[run_policies] progress {t+1}/{Q} "
+                f"({(t+1)/Q*100:.1f}%)"
+            )
+        qid = int(request_query_ids[t])   # The query index for this request
         lists = query_list_ids[qid]
 
-        # (Optional) de-duplicate: nprobe is small, a simple set is enough
-        unique_lists = []
+        # (Optional) de-duplicate: nprobe is small, so set is enough
+        unique_lists: List[int] = []
         seen = set()
         for cid in lists:
             c = int(cid)
@@ -101,9 +184,9 @@ def run_policies_on_queries(
                 unique_lists.append(c)
 
         for pname, policy in policies.items():
-            # update access stats
+            # Update access statistics: use time step t as "current time"
             for cid in unique_lists:
-                policy.on_access(cid, qid)
+                policy.on_access(cid, t)
 
             dram_ops = 0
             ssd_page_ops = 0
@@ -126,8 +209,8 @@ def run_policies_on_queries(
             ssd_pages[pname].append(ssd_page_ops)
             ssd_bytes[pname].append(ssd_byte)
 
-        # rebalance + migration
-        if (qid + 1) % rebalance_interval == 0:
+        # Periodic rebalance + record migrations
+        if (t + 1) % rebalance_interval == 0:
             num_rebalances += 1
             for pname, policy in policies.items():
                 ms = policy.rebalance(list_bytes_list, count_eviction=count_eviction)
@@ -137,9 +220,12 @@ def run_policies_on_queries(
                 _, t_us = migration_overhead_us(ms.moved_bytes, tier)
                 migrated_time_us[pname] += float(t_us)
 
-    # summarize
+    # ------------------------------------------------
+    # 5) Aggregate metrics
+    # ------------------------------------------------
     out: Dict[str, Dict[str, float]] = {}
-    denom_useful = float(Q * k * bytes_per_vec)  # amount of data returned for top-k results
+    # This round has Q requests, each returns k vectors, each vector has bytes_per_vec bytes
+    denom_useful = float(Q * k * bytes_per_vec)
 
     for pname in policies:
         ls = latencies[pname]
@@ -158,7 +244,10 @@ def run_policies_on_queries(
 
         total_mig_b = float(migrated_bytes[pname])
         mig_b_per_q = total_mig_b / float(Q)
-        avg_mig_clusters = (float(migrated_clusters[pname]) / float(num_rebalances)) if num_rebalances > 0 else 0.0
+        avg_mig_clusters = (
+            float(migrated_clusters[pname]) / float(num_rebalances)
+            if num_rebalances > 0 else 0.0
+        )
 
         total_mig_t = float(migrated_time_us[pname])
         mig_t_per_q = total_mig_t / float(Q)

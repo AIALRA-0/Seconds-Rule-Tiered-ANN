@@ -233,6 +233,28 @@ if [[ "${PIPELINE_OK}" -eq 0 ]]; then
 fi
 
 # -------------------------
+# 5b) Post-processing: compact dump + analysis figures
+# -------------------------
+section "5b) Post-processing: dump_results + plot_results"
+
+# This step will automatically find the latest tiered_ann_seconds_rule_* directory under results/,
+# and print the COMPACT summary you just saw (so you can copy it directly for me)
+if [[ -f "scripts/dump_results.py" ]]; then
+  run_cmd python scripts/dump_results.py
+else
+  echo "NOTE: scripts/dump_results.py does not exist, skipping dump."
+fi
+
+# This step will read the agg CSV from that run and generate clearer faceted plots,
+# which are output by default to the figs/ subdirectory under the corresponding run directory
+if [[ -f "scripts/plot_results.py" ]]; then
+  run_cmd python scripts/plot_results.py
+else
+  echo "NOTE: scripts/plot_results.py does not exist, skipping plotting."
+fi
+
+
+# -------------------------
 # 6) Verify outputs for report
 # -------------------------
 section "6) Verify report artifacts (CSVs + figures)"
@@ -289,7 +311,7 @@ fig_dir.mkdir(parents=True, exist_ok=True)
 logs = sorted(log_dir.glob("one_click_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
 log_file = logs[0] if logs else None
 
-# 递归搜所有图：results/**/{*.png,*.pdf,*.jpg,*.jpeg}
+# Search All：results/**/{*.png,*.pdf,*.jpg,*.jpeg}
 fig_files = sorted(
     [
         p

@@ -1,948 +1,1020 @@
-# Seconds-Rule Tiered ANN：面向混合 DRAM+SSD 向量检索的秒级热集分层策略评测
+# Evaluating Caching Policies for IVF-based ANN Engines under Tiered DRAM and SSD Storage
 
-Lucas Ding
+### Lucas Ding
+
+## 1. Abstract
+
+Approximate nearest neighbor search (Approximate Nearest Neighbor, ANN) is the core operator of vector retrieval systems, many applications need to find the most similar top-k vectors from massive vector collections within extremely short time. The problem is that vector indexes are often very large, the cost of putting everything into DRAM is high, while placing data on SSD will push latency to the millisecond level, and will especially significantly worsen tail latency (p95) . Classic conclusions like the Five Minute Rule tell us that the huge differences in cost and performance across storage hierarchies force systems to do tiering and cache management, and the key challenge is: which data should reside permanently in DRAM, and which can stay on SSD.
+
+This project combines an ANN engine with a tiered DRAM + SSD model, uses an IVF structure as the index backbone, and manages the residency of IVF inverted lists (IVF lists) between DRAM and SSD with different caching policies. We compare multiple policies, including the two extreme baselines all DRAM and all SSD, the traditional recency policy LRU, the traditional frequency policies naive LFU and window LFU, and the seconds rule policy we implemented.
+
+Through a unified experimental pipeline, we run parameter sweeps under different DRAM ratios, different nprobe values, and different SSD IOPS constraints, examining the recall–latency tradeoff, as well as I/O amplification and migration overhead. Here, nprobe indicates how many clusters / inverted lists are accessed per query in an IVF index, a larger nprobe means more candidates and higher accuracy, but also higher compute and I/O cost; recall measures what fraction of the “true correct answers” that should be returned are actually retrieved by ANN; I/O amplification describes how many extra times the system is forced to read from SSD in order to obtain a small number of useful results.
+
+Our goal is to maintain acceptable recall as much as possible under limited DRAM capacity, while significantly reducing tail latency caused by SSD reads, and keeping migration overhead within a reasonable range, thus providing policy-selection recommendations for practical system design. The experimental results show that system latency is highly controlled by the number of SSD pages read, and p95 latency is mainly determined by I/O amplification. Increasing nprobe can steadily improve recall, but it also linearly amplifies the size of inverted lists that must be scanned, further amplifying SSD I/O. When comparing different policies, window LFU and naive LFU can often trade relatively low migration overhead for some degree of I/O reduction across multiple workloads; while in scenarios where hotspots change faster, LRU and seconds rule are more able to track hotspots in time, thereby further reducing SSD reads, but the migration cost will also increase significantly.
+
+In addition, under the page-level latency model used in this work, if the SLA (Service Level Agreement, service-level agreement, that is, the latency threshold the system promises externally) is set to 200 microseconds or 500 microseconds, apart from all DRAM, the other policies are difficult to meet the target within the given parameter range. This indicates that merely placing part of the IVF lists into DRAM is not enough, and stronger I/O-avoidance methods are needed next, such as more aggressive compression and tiered candidate filtering mechanisms.
+
+## 2. Introduction
+
+### 2.1 Problem Motivation
+
+Vector retrieval is increasingly common in real systems: image search encodes images into vectors, semantic search and large-model retrieval augmentation encode text or dialogue history into vectors, recommendation systems represent user and item features as vectors, log analysis compresses user behavior sequences into vector embeddings. All these applications after going online will face a common problem: the scale of the vector database will quickly expand to millions, tens of millions, or even hundreds of millions or more, and the dimension of each vector is often between 100～1000. Doing exact nearest neighbor search directly requires comparing each query vector with every vector in the database one by one, with complexity roughly $O(Nd)$, which is not only computationally huge, but also causes a lot random memory accesses, in high-concurrency scenarios it cannot sustain latency and is also hard to meet throughput requirements. Therefore engineering practice usually adopts Approximate Nearest Neighbor (Approximate Nearest Neighbor, ANN) techniques, ANN is a class of vector retrieval methods that allow results to be only “approximately nearest” rather than absolutely nearest neighbors, trading a small loss of accuracy for significantly lower latency and higher throughput.
+
+The real engineering difficulty is: the index structure and the vector data itself often cannot be fully placed in DRAM. Take a conservative example, $10^9$ 128-dimensional float32 vectors is already close to 512GB, and the accompanying index structure will additionally occupy a large amount of space. In real systems it is hard to equip a single service with so much DRAM, and DRAM cost and power consumption are very high. SSD has much larger capacity and is much cheaper, which looks like a more natural medium, but SSD random access latency is several orders of magnitude higher than DRAM: DRAM access is usually tens of nanoseconds, while a single random SSD read is often tens to hundreds of microseconds. For a single query, even if the average latency is barely acceptable, this gap will very obviously push up tail latency (such as p95 / p99) , directly affecting online SLA and user experience——especially in multi-tenant, high-concurrency, and long pipelines (for example “retrieval + reranking + model inference”) scenarios, millisecond-level jitter in retrieval is easily amplified.
+
+This naturally turns the problem into a tiered storage and cache management problem: under the premise that “DRAM is fast but expensive, SSD is slow but cheap”, we must explicitly decide which data should reside in DRAM, which data can stay only on SSD, and how the system should dynamically adjust the boundary between these two parts according to access patterns at runtime. The core idea given by classic conclusions like the Five Minute Rule is: whether data should be placed on a faster medium cannot be decided only by capacity constraints, but must also consider access frequency, data size, and the price and access cost per unit capacity of different media; for sufficiently frequently accessed objects, placing them on a more expensive but faster medium (such as DRAM) is worthwhile, while sparsely accessed cold data should remain on a cheaper medium (such as SSD) . In vector retrieval scenarios, query distributions across different applications, different stages, and even different time periods can be completely different: some workloads have long-term stable and concentrated hotspots, some workloads have rapidly migrating hotspots, and some are close to uniform. These differences directly change the optimal decision of “which data is worth keeping in DRAM”, and therefore also require us to systematically compare the performance of different caching policies under these workloads, rather than hoping that one fixed policy “performs well in all scenarios”.
+
+### 2.2 Research Question
+
+This project focuses on several more specific and actionable questions, rather than vaguely saying “vector retrieval is slow on SSD”: 
+
+* **What does tiered management look like when using IVF lists as the caching unit？**
+  In ANN engines with inverted-list structures like IVF, each cluster corresponds to an inverted list (IVF list) , and each query will access only a small number of clusters. We treat each list as a “block” that can be placed in DRAM or SSD, that is, we do caching and migration at list granularity: if a list is hot we try to move it to DRAM, if it becomes cold we put it back on SSD. A key question is, under this setting, what the decision space of tiered management looks like——for example, when to trigger migration, how much to migrate each time, and what signals to use to judge whether a list is worth residing in DRAM.
+
+* **When DRAM is tight, how much tail latency can policies really save？**
+  In reality DRAM can only hold a small fraction of all lists, and many queries inevitably have to access SSD. We want to systematically evaluate: under a fixed DRAM fraction (for example only 5% or 20% of lists can fit) , how different caching policies change the overall performance curve of queries——specifically, on one hand whether recall is affected by “skewed hot/cold residency decisions”, and on the other hand how much average latency and tail latency like p95 can be reduced, and whether there exists some policy combination that, under a given DRAM cost, can bring p95 down to an engineering-acceptable level.
+
+* **Under what workloads does a policy like seconds rule that “emphasizes reuse interval” have an advantage？**
+  Traditional LRU mainly looks at “time of most recent access”, LFU mainly looks at “cumulative access count”, while seconds rule cares more about the “reuse interval”, that is, how many queries elapse between two accesses. What we want to ask is: under different access distributions such as default, fast-changing hotspots, slow-changing hotspots, uniform, and Zipf, does this reuse-interval-based signal fit data access patterns better than pure recency or pure frequency？For example, when the hotspot window moves very fast, can seconds rule more accurately distinguish “short-interval high-value reuse” from “cold data that is touched only occasionally”, thus achieving a higher DRAM hit rate and lower SSD access volume under the same DRAM capacity.
+
+* **Will the benefits brought by policies be eaten up by migration cost？**
+  Moving lists in and out of DRAM itself requires I/O and CPU, which is not free in real systems: migration consumes SSD bandwidth, affects concurrent queries, and may also increase code complexity and maintenance cost. Therefore we not only compare policy benefits in recall and latency, but also explicitly count total migrated bytes, the average migration overhead amortized per query, and how many clusters need to be migrated per rebalance. The concrete questions we want to answer are: under different workloads and DRAM configurations, whether there exists a policy that shows “great tail latency on paper, but the amount of data migrated per second has already reached an unacceptable level”; and under an acceptable migration budget, which types of policy combinations are more cost-effective.
+
+### 2.3 Contributions
+
+The main work of this project can be summarized as follows: 
+
+* **Built a tiered model for IVF-style ANN**
+  Around the IVF index, we abstract the system as a combination of “ANN computation + tiered storage”: explicitly distinguishing DRAM and SSD as two tiers, and using a configurable dram fraction parameter to control what fraction of IVF lists DRAM can hold. On this basis, we introduce a page-level I/O latency model, decomposing SSD reads into “number of pages × cost per page”, so we can use a unified formula to estimate the I/O latency of each query, and distinguish it from ANN computation time. This model allows us to directly derive the source of p95 latency changes from statistics such as `avg ssd pages` and `avg ssd bytes`, providing quantitative support for the subsequent analysis that “latency is mainly determined by I/O amplification”.
+
+* **Implemented and compared multiple caching policies, covering extreme baselines, classic policies, and seconds rule**
+  On top of the tiered model above, we implemented multiple list-level caching policies: including the two extreme baselines “all lists in DRAM” all DRAM and “all lists in SSD” all SSD, to provide an ideal lower bound and a worst upper bound; including LRU based on recency signals, and naive LFU and window LFU based on frequency signals, to represent classic policies commonly used in practice; and the seconds rule policy we implemented based on the reuse-interval idea, to explore whether reuse interval can provide a better decision signal when hotspots change quickly. These policies share a common interface, so they can be compared directly within the same experimental pipeline.
+
+* **Systematically evaluated policy behavior under multiple workloads and parameter combinations**
+  To avoid drawing one-sided conclusions from a narrow scenario of “single distribution + single parameter”, we designed multiple access distributions: including a default distribution close to real traces, two hotspot distributions with fast-changing and slow-changing hotspots, a fully uniform distribution, and a Zipf distribution with long-tail characteristics (s=1.2) . Under each workload, we systematically swept key parameters such as DRAM ratio (for example 5%, 20%) , nprobe (1, 4, 16) , and SSD max IOPS (1M, 5M) , and uniformly recorded metrics such as recall, average latency, p95/p99, I/O amplification, SSD pages read, and migrated bytes, so as to observe how policies behave under different “space budgets” and “hardware constraints”, rather than looking at only a single point result.
+
+* **Provided unified result export and analysis assets, forming a reusable experiment and report framework**
+  Aggregate raw per-query statistics into `ann_policy_agg.csv`, including mean, standard deviation, confidence intervals, and so on, to facilitate subsequent statistics or plotting; 
+  Automatically compute the maximum reachable recall for each policy under different SLAs (for example 200µs, 500µs) , output `sla_reachable_recall.csv`, making it easy to compare policies from the perspective of “performance promises”; 
+  Generate several key tables (for example the key-point summary table, the SLA table) and multiple visualization figures (p95 vs DRAM, I/O amplification vs DRAM, migration overhead vs DRAM, recall–latency frontier, and so on) , and collect them uniformly in the `report_assets` directory; 
+  Finally stitch everything together into a master report with a one-click script.
+  This asset set makes it so that if new policies are added later, a new dataset is used, or hardware parameters are changed, one only needs to reuse the same pipeline to obtain an analysis report with consistent style and complete structure.
+
+## 3. Background & Related Work
+
+### 3.1 Approximate Nearest Neighbor and IVF
+
+The goal of approximate nearest neighbor (Approximate Nearest Neighbor, ANN) is: given a query vector $q$, find the $k$ vectors with the smallest distance in the database vector set $X = {x_i}$. Here, the “distance” is usually Euclidean distance or inner-product distance. The most straightforward exact approach is to compute the distance between $q$ and all $x_i$ for every query, with time complexity roughly $O(Nd)$ (where $N$ is the number of vectors, and $d$ is the dimension) , when $N$ reaches the million or hundred-million scale, this linear scan is unacceptable in both latency and throughput, so engineering systems widely adopt ANN techniques, trading a controlled loss in accuracy for lower latency.
+
+The inverted file index (Inverted File Index, IVF) is a classic ANN structure. Its core idea is to make an explicit two-stage “coarse-to-fine” search: 
+
+* In the offline stage (index building) , first use a coarse quantizer to partition the vector space into $nlist$ clusters, which can also be understood as training a set of centroid vectors ${c_j}_{j=1}^{nlist}$. Each database vector $x_i$ is assigned to its nearest centroid $c_j$, and is appended to the inverted list corresponding to that cluster, and this list is an IVF list.
+* In the online query stage, first compute the distance between $q$ and ${c_j}$ over all cluster centroids, select the nearest few centroids, and then only scan the inverted lists corresponding to these clusters, compute the exact distance to $q$ for the candidate vectors in the lists, and then select top-$k$ from the merged candidate set.
+
+In the query stage, the number of scanned clusters is usually denoted as $nprobe$. Intuitively, $nprobe$ is a key accuracy–performance knob: 
+
+* The smaller $nprobe$ is, the fewer lists each query accesses, the fewer distance computations and storage reads are needed, so latency is lower, but it is easy to miss true nearest neighbors, and recall will drop; 
+* The larger $nprobe$ is, the larger the candidate set and the wider the covered cluster range, so it is less likely to miss the true neighbors, recall usually increases monotonically, but compute cost and I/O cost also roughly scale proportionally.
+
+In engineering practice, open-source libraries such as Faiss have made IVF a fairly general component, and support combining it with compression techniques such as Product Quantization $PQ$, for example IVF-PQ、IVF-OPQ etc. Under fixed hardware resources, systems can tune parameters such as $nlist$, $nprobe$, the number of PQ subspaces, and codebook size, to find a tradeoff among speed, memory footprint, and recall that fits a specific workload.
+
+This project chooses IVF as the research object mainly for two reasons: 
+
+* The candidate set is naturally “grouped by cluster”: IVF partitions the database into inverted lists, each list corresponds to a cluster, so we can very naturally treat “one list” as the basic unit of caching and migration, which corresponds in implementation to “whether the IVF list of a cluster resides permanently in DRAM, or is stored only on SSD and read on demand”. This is easier to manage and model than caching at the granularity of a “single vector”.
+* The cost decomposition is clear, making it easy to combine with an I/O model and caching policies: the main cost of an IVF query can be cleanly split into two parts: the cluster-selection stage computes distances to all centroids in memory, this part almost does not involve external storage access; the list-scanning stage accesses several lists, which includes both the scan/compute overhead for lists in DRAM, and the page-level read overhead for lists on SSD.
+
+This structure is very suitable for layering on the DRAM + SSD tiered model and the page-level I/O latency model we construct, so we can clearly see the direct impact of strategies like “which lists to cache in DRAM” on SSD I/O volume, latency distribution (especially p95) , and overall system performance.
+
+### 3.2 Tiered Memory and Caching Policies
+
+The basic setting of tiered storage is: DRAM is fast but expensive, SSD is slow but has large capacity and is cheap. In vector retrieval scenarios, the index structure and vector data are usually much larger than DRAM capacity, so it is impossible to keep everything resident in memory, and the system must decide which data goes into DRAM and which can only stay on SSD. The core view of the Five Minute Rule is: which tier an object should be placed on depends not only on capacity constraints, but also on its access frequency and the unit cost of different media, we cannot assume access is uniform, and we also cannot look only at “how much fits”.
+
+When designing caching policies in practice, the two most commonly used signals are recency and frequency. recency believes that “data accessed recently is more likely to be accessed again soon”, with a typical policy being LRU (Least Recently Used) . LRU always prioritizes keeping the most recently accessed data, and evicts those that have not been accessed for the longest time, its advantage is that it is sensitive to hotspot switches and can quickly follow new hotspots, its disadvantage is that it is easily polluted by one-time scans: a large batch of data accessed only once will be temporarily treated as “hot”, squeezing truly long-term valuable objects out of DRAM.
+
+frequency believes that “data accessed many times in the past will continue to be accessed in the future”, with a typical policy being LFU (Least Frequently Used) . LFU maintains an access counter for each object, and prioritizes keeping objects with high cumulative access counts, it is suitable for scenarios where hotspots are relatively stable and is not easily disturbed by a single scan. But the problem of naive LFU is also obvious: the counter accumulates without bound, early hotspots may occupy the cache for a long time, and new hotspots need a long time to “build up” sufficiently high counts, so a window or decay mechanism is needed to gradually forget old history.
+
+To leverage both recency and frequency, engineering practice often uses window LFU or LFU with decay. window LFU can be understood as “only counting accesses within a recent window”, history outside the window is either discarded directly or given very low weight, thus preventing early hotspots from permanently occupying the cache; compared with naive LFU, it is more sensitive to hotspot changes, but is also less likely than pure LRU to be polluted by one-off traffic.
+
+seconds rule represents another line of thinking, it does not directly look at “most recent access” or “cumulative access count”, but instead focuses on the reuse interval between two accesses to the same object. If an object is repeatedly accessed within a very short time, then it is a typical “short-interval reuse” object and is more worth promoting to DRAM; if the interval is long each time, even if the total access count is not low, it may not be worth occupying precious memory for a long time. Classic seconds rule sets a threshold to distinguish short-interval reuse from long-interval reuse, and only gives sufficiently high caching priority to the former.
+
+In this project, the “object” in the above policies is an IVF cluster / list. We use LRU、naive LFU、window LFU and seconds rule to decide which lists should reside in DRAM and which should remain on SSD, so that under different access distributions and hotspot change speeds, we can systematically compare the tradeoffs among latency (especially p95) , I/O amplification, and migration overhead for different policies.
+
+### 3.3 SSD based and Hybrid ANN Systems
+
+In large-scale vector retrieval, if we simply place IVF lists entirely on SSD and, for each query, read all corresponding lists back according to nprobe, the system will quickly be bottlenecked by I/O throughput and random-access latency. Therefore many works are not simply “moving the parts that do not fit in memory onto SSD”, but instead start from the index structure itself, designing more “SSD-friendly” ANN solutions so that the amount of external storage access truly triggered per query is as small as possible.
+
+DiskANN is a representative system-level work, aiming to host tens of billions of vectors on SSD on a single machine, and achieve high recall under strict latency constraints. It adopts a hierarchical graph structure: the upper-layer graph is relatively sparse and is used to quickly locate candidate regions; the lower-layer graph is denser and is used for fine-grained search within a local region. During querying, it does not linearly pull up an entire list as IVF does, but instead walks a bounded-length path along graph adjacency edges, accessing only a small number of nodes related to the current search boundary (that is, a small number of vector storage locations) , thereby keeping the number of random I/Os at a very small constant level. DiskANN also combines DRAM caching, caching the most frequently accessed nodes or graph layers in memory, further reducing SSD pressure.
+
+SPANN represents another design route centered on “partitioning + bounded I/O”. It partitions the vector space into many partitions, and then builds a local index structure within each partition. During querying, it first uses a lightweight module to select a small number of candidate partitions, and then performs a heavier search inside these partitions. The whole process is designed so that “the number of accessed partitions has a hard upper bound”, which corresponds on SSD to “how many data blocks/files each query can read at most”, thus guaranteeing controllable overall latency. Compared with pure graph structures, SPANN emphasizes modeling “partition boundaries” and “cross-partition costs”, which is important in SSD scenarios because crossing many partitions implies a large amount of random I/O.
+
+Product Quantization (PQ) and its variants are a more fundamental but very critical family of techniques. PQ uses codebooks over subspaces to approximate the original vectors, often reducing storage and bandwidth from float32 down to tens or even single-digit bits per dimension. A typical approach is to store only PQ codes and a small amount of auxiliary information on SSD, during querying first use PQ codes to compute approximate distances, quickly filter a relatively small set of candidates from a massive number of vectors, and then only for these candidates read the original vectors from DRAM or SSD for exact computation. PQ is often combined with IVF into IVF-PQ: IVF handles coarse partitioning and shrinking the candidate range, PQ handles compression and fast scoring, and this combination is already the default baseline for many industrial ANN systems.
+
+learned indexes treat the index itself as an approximate function that can be learned: use a model to predict “where a key (here it can be some vector encoding or hash) should fall in position or partition”, thereby reducing lookup cost. In vector retrieval scenarios, the idea of learned indexes usually does not completely replace IVF or graph structures, but serves as an auxiliary module to improve partition selection, reduce the number of misselected partitions, or help route queries better to machines / shards that are “likely to hit”. Their common goal is still to reduce unnecessary accesses, rather than simply improving CPU computation efficiency.
+
+The shared conclusion of these system-level and algorithm-level works is: in SSD scenarios, what truly determines latency is not “whether cache replacement is done”, but “how many bytes must be read from SSD per query, and how many random I/Os are performed”. Caching policies are of course important, but if the underlying structure requires pulling up lists that are themselves very large or very many, then merely doing simple list-level caching between DRAM and SSD makes it hard to push p95 below strict SLA requirements. This is also why this project deliberately chooses, within a fixed IVF framework, to change only the “residency policy of lists in DRAM/SSD”, and to isolate and observe “the limit of what caching alone can achieve”, providing a clear baseline for later layering on PQ, graph structures, or more complex routing.
+
+### 3.4 Positioning of this Work
+
+The positioning of this project is closer to a course project and a system design exercise. It does not try to directly surpass complete industrial systems like DiskANN and SPANN in absolute performance, but instead intentionally “drops one dimension”: it fixes the search algorithm as IVF, sets aside more complex engineering optimizations (such as cross-machine distribution, asynchronous I/O pipelines, operating-system tuning, and so on) , and focuses on the more controllable and more interpretable question of “under a DRAM + SSD tiered model, what can list-level caching policies actually look like”. In other words, we treat IVF as a stable backbone, and do systematic exploration only along the single dimension of “which tier the lists live on”, so as to avoid being drowned by too many engineering details. The value of this positioning is mainly reflected in the following aspects
+
+Decompose a complex system into three parts: ANN search, I/O model, and caching policy, so each part can be explained and verified independently
+We intentionally keep the ANN part as “clean” as possible: using the standard IVF search workflow, explicitly exposing parameters such as nprobe and nlist, and using all DRAM as a reference lower bound of “pure compute latency + highest recall”; the I/O part uses a simple but transparent page-level latency model, caring only about “how many pages were read, and how expensive each page is”; the caching policy part is only responsible for deciding which IVF lists go into DRAM and which remain on SSD. This decomposition allows readers to clearly distinguish: whether a phenomenon is due to the ANN algorithm itself (for example nprobe is too large) , page latency is too high, or the caching policy failed to capture the true hotspots, instead of blurring all problems into “SSD is slow” or “the index is bad”.
+
+Through multi-workload comparisons, show that policy pros and cons are not fixed, but are determined by the access distribution and hotspot change speed
+We design multiple workloads such as default, fast-changing hotspots, slow-changing hotspots, uniform, and Zipf, and under each workload evaluate all policies using the same set of metrics (p95 latency, I/O amplification, migration overhead, SLA reachability, and so on) . Such comparisons clearly show that: LRU / seconds rule have more advantages when hotspots move rapidly, window LFU is more cost-effective when hotspots are relatively stable but still evolve, while in nearly uniform-access scenarios, any “smart” policy will not be much better than simple baselines. Through these results, readers can directly see that “no policy is always optimal”, and policies must be selected according to concrete access patterns, rather than blindly applying some “industry common solution”.
+
+Through explicit migration statistics, compare policies not only by latency and recall, but also by implementation cost, avoiding focusing only on superficial gains
+In most discussions about caching policies, migration cost is often ignored: as long as the hit rate goes up and latency goes down, it is considered a “good policy”. This project explicitly tracks migrated bytes, migration count, and migration time for each policy in the experimental framework, and normalizes these quantities to the scale of “average per query”, thereby exposing extreme behaviors such as “p95 looks good but several GB were migrated”. This design reminds us: no policy is a free lunch, if it is to be put into a real system, one must consider query latency, SSD bandwidth consumption, and the impact of background migration on system stability at the same time. By quantifying these costs, system designers can more rationally evaluate “whether a small latency gain is worth so much migration”, rather than looking only at the superficial p95 number.
 
 
+## 4. System Model & Problem Formulation
 
-## 0. 摘要
+### 4.1 ANN Engine and IVF Lists
 
-### 0.1 问题背景
+We use IVF as the main structure of ANN, and we can understand the whole query process as a two-stage pipeline with two layers of “coarse-to-fine”.
 
-在语义搜索、检索增强生成等现代人工智能应用中，系统往往要在一个规模巨大的向量集合中，根据用户查询向量，找出若干个距离最近的向量。向量检索，或近似最近邻检索，需要同时兼顾两个基本目标：一是检索质量高，也就是召回率要足够好；二是响应足够快，尤其是尾部请求的延迟要可控。
+The first layer is the coarse search stage (coarse search) . The system maintains a set of cluster centroids (that is, the coarse quantizer) , with a count of $nlist$. Given a query vector $q$, we first compute the distances from $q$ to all cluster centroids, then sort them from near to far by distance, and select the nearest $nprobe$ clusters. The output of this step is not the final result, but a set of routing decisions about “which regions should be focused on”, which can be formalized as
+$$
+\text{Top}(q, nprobe) \subseteq {1, 2, \dots, nlist},
+$$
+where $\text{Top}(q, nprobe)$ is the set of the top $nprobe$ cluster IDs for $q$.
 
-在小规模场景下，向量索引可以完整放入 DRAM，延迟和吞吐往往不是瓶颈。但在实际的线上系统中，向量数量容易达到亿级甚至更高，索引会远远超过单机 DRAM 容量。这时，系统通常采用分层存储：把一部分索引放在访问速度很快但价格昂贵的 DRAM，把剩余部分放在容量大但访问延迟高的 SSD。这样一来，如何利用有限的 DRAM 容量就成了核心系统问题之一。
+The second layer is the fine search stage (list scan) . Each cluster $c$ has an inverted list $L_c$, which stores the IDs of database vectors assigned to this cluster and the corresponding vectors or encodings. During querying, we only scan the small subset of clusters in $\text{Top}(q, nprobe)$, and score entries in their inverted lists one by one. Denote the inverted list of the $c$-th cluster as $L_c$, then the candidate set of a query is
+$$
+C(q)=\bigcup_{c\in \text{Top}(q,nprobe)} L_c.
+$$
+Within these candidates, we then compute the (exact or approximate) distance between the query vector $q$ and each candidate vector, and select the $k$ vectors with the smallest distances from $C(q)$ as the final returned results. Intuitively, coarse search decides “which buckets to scan”, and list scan decides “which specific items to pick from the buckets”.
 
-已有系统中常见的做法可以粗略分为几类。最简单的一类是“静态切分”，在离线阶段预先指定哪些索引分片常驻 DRAM，哪些分片放在 SSD。这种方法实现简单，但难以适应请求模式随时间变化的情况。另一类是直接套用传统缓存策略，例如基于最近访问时间的 LRU，或基于访问频率的 LFU，把索引条目视作普通缓存对象，谁“热”谁进 DRAM。还有一些系统采用窗口化频率统计，试图兼顾“近期热点”和“长期高频”之间的平衡。
+In this project, this IVF structure has an additional role: it naturally provides the granularity for caching and migration. Each inverted list $L_c$ is treated as an independent “object”, either entirely placed in DRAM or entirely placed on SSD. For a query $q$, if a hit cluster $c$ happens to reside in DRAM, then scanning $L_c$ requires no SSD I/O; if $L_c$ is on SSD, we need to read its corresponding data pages from SSD into memory first. Therefore, for a query, “how many SSD accesses a query needs to trigger” is almost equivalent to “among the clusters in $\text{Top}(q, nprobe)$, how many clusters have lists that are not in DRAM”.
 
-这些做法在工程实践中可以在一定程度上缓解问题，但在大规模向量检索场景下仍然存在几方面不足。首先，传统缓存策略往往以单个键值对象为粒度，而向量索引中的访问模式更复杂，一个查询会在短时间内访问一组高度相关的数据块，单纯按条目计数很难捕捉这种“团块式”的热点结构。其次，向量检索的查询分布通常具有明显的时间突发性，一小段时间内会出现非常集中的热点，随后又迅速冷却，过于粗糙的时间尺度会让策略反应滞后。最后，复杂的 ANN 算法本身就有多层结构，分层策略如果与索引结构脱节，容易导致额外的 I/O 放大和迁移开销，拉高尾延迟。
+From the parameter perspective, nprobe is a core knob controlling the performance–accuracy tradeoff: 
 
-综上，需要一种更适配向量检索特点的分层策略，既能在秒级时间尺度上迅速识别真正的热点集合，又能控制 DRAM 和 SSD 之间的数据迁移成本，在有限的 DRAM 容量下尽可能提升召回率并压低尾延迟。Seconds-Rule Tiered ANN 正是在这一背景下提出，重点关注“秒级热集”的识别与利用。
+* The larger nprobe is, the more clusters $\text{Top}(q, nprobe)$ contains, the larger the candidate set $C(q)$ becomes, the more likely it is to cover the true nearest neighbors, and recall will improve; 
+* But at the same time, more lists need to be scanned, CPU computation increases, and the amount of DRAM / SSD data accessed is also linearly amplified, so I/O pressure and latency rise accordingly.
 
+In this project, we set nprobe to ${1, 2, 4, 8, 16, 32}$ for systematic comparison: from the all DRAM results, we can clearly see that as nprobe increases from 1 to 16, recall increases from a medium level and gradually approaches 1, but the average latency and p95 latency also rise significantly, which is typical behavior of IVF in engineering practice. And once SSD is introduced into the model, nprobe not only affects CPU computation time, but more directly determines “how many lists a query touches, and how many SSD reads it triggers”, thereby scaling up into overall tail latency through SSD page counts and I/O amplification.
 
+### 4.2 Tiered DRAM + SSD Model
 
-### 0.2 方法概述
+We explicitly model two storage tiers: 
 
-围绕上述问题，本工作搭建了一套可复现的评测环境，整体方法由三个核心部分组成：端到端实验流水线、混合存储模拟与评测框架、以及一组对比策略和评价指标。
+* DRAM: access latency is very small, and can be approximated as only computation time plus a tiny amount of memory-access overhead
+* SSD: capacity is large but random access is slow, and access cost is given by the page-level read model
 
-首先，构建了一条端到端的实验流水线，用于从配置到结果自动化地完成一次完整实验。流水线从一个统一的配置入口开始，配置中包含数据集路径、索引类型、工作负载轨迹、候选分层策略列表、DRAM 容量扫描范围以及基础系统参数。流水线依次完成以下步骤：准备或加载向量索引，初始化模拟的 DRAM 和 SSD 视图，按配置重放查询请求序列，在每一次查询过程中记录访问路径和延迟，以及策略做出的搬迁决策；实验完成后，对单次运行的原始记录进行整理，输出结构化的 CSV 文件，再在此基础上进行聚合统计和可视化，生成用于分析的图表。整个过程中，重要的环境信息和每一阶段的关键信息都会写入日志，以便他人根据同一份 Report Bundle 和软件版本重现实验。
+In this model, the basic unit of caching and migration is an IVF list, that is, we decide at cluster granularity whether a list currently resides in DRAM or SSD. For each cluster $c$, we maintain a residency flag $tier(c)$: 
 
-其次，构建了一个面向混合 DRAM+SSD 配置的分层 ANN 模拟与评测框架。框架抽象出两级存储：上层 DRAM 表示容量有限但访问延迟极低的区域，下层 SSD 表示容量较大但访问延迟显著更高的区域。在模拟中，每个查询都被展开为对若干索引单元或数据块的访问，分层策略根据当前状态决定每次访问是在 DRAM 中命中还是需要向 SSD 发起 I/O。当访问落在 SSD 时，框架会累积相应的访问时延和 I/O 统计，并在策略需要时触发数据迁移，将部分数据从 SSD 提升到 DRAM，或者从 DRAM 驱逐到 SSD。通过在不同的 DRAM 容量下重复这一过程，可以观察策略在资源约束变化时对延迟、I/O 放大和迁移成本的综合影响。
+* $tier(c)=DRAM$: the list of cluster $c$ resides permanently in DRAM, scanning this list produces no SSD I/O
+* $tier(c)=SSD$: the list of cluster $c$ is stored on SSD, scanning this list requires first reading the corresponding data pages from SSD into memory
 
-在策略层面，框架中实现并比较了多种典型策略与 Seconds-Rule 策略，形成一组有代表性的对照组：
+The DRAM capacity constraint is represented by a dimensionless $dram\ fraction$. In the experiments, $dram\ fraction$ takes $0.05$ and $0.2$, which can be understood as: 
 
-* All-DRAM 策略：假设所有索引数据都常驻 DRAM，不依赖 SSD 提供任何查询路径。这一极端配置给出了理想情况下的延迟和 I/O 表现，可以视作性能上界，用于衡量其他策略“距离最好情况还差多少”。
+* $dram\ fraction=0.05$: DRAM can hold at most about $5%$ of all lists
+* $dram\ fraction=0.2$: DRAM can hold at most about $20%$ of all lists
 
-* All-SSD 策略：假设所有索引数据都放在 SSD 中，每次查询都需要从 SSD 读取必需的数据结构。这一配置给出了延迟和 I/O 的下界表现，提供了“完全不做分层”的参考水平，有助于量化分层策略带来的绝对改善。
+Here we constrain capacity by “number of lists”, and the actual occupied bytes will vary with the length distribution of lists, which is also one reason why migration overhead differs greatly across policies later.
 
-* LRU 策略：采用最近最少使用原则，以最近访问时间作为保留或驱逐的依据。每次访问都会更新对象的时间戳，在需要释放 DRAM 空间时优先驱逐最久未被访问的数据。该策略强调时间局部性，即“最近访问过的数据在不久的将来仍有较大概率再次访问”。
+To characterize SSD access cost, we adopt a page-level I/O model. All accesses that fall on SSD are decomposed into random reads of fixed-size data pages. By fitting experimental results, we can infer the average cost per page read: 
+$$
+t_{\text{page}} = 20 + \frac{10^6}{\text{max\_iops}}
+$$
+where $\text{max\_iops}$ is the theoretical upper limit of SSD random read capability. In the experiments we choose two levels: 
 
-* LFU 策略：采用最少使用频率原则，以访问次数作为保留或驱逐的主要依据。访问频率较高的数据会倾向于保留在 DRAM 中，而长期访问频率较低的数据在需要腾挪空间时更容易被驱逐。该策略强调长期热门数据的价值，更适合访问模式相对稳定的场景。
+* $\text{max\_iops}=10^6$, $t_{\text{page}}\approx 21\ \mu s$
+* $\text{max\_iops}=5\times 10^6$, $t_{\text{page}}\approx 20.2\ \mu s$
 
-* Window-LFU 策略：在 LFU 的基础上引入时间窗口，只统计一定时间范围内的访问次数，把过久远的访问逐步“遗忘”。这样可以避免历史早期的高频访问长期占据 DRAM，有利于捕捉工作负载在时间上的动态变化，提高适应突发热点的能力。
+This formula can be understood as: around $20\ \mu s$ is a “base access overhead”, and $\frac{10^6}{\text{max\_iops}}$ approximately characterizes the queuing or scheduling overhead caused by IOPS capability differences; when $\text{max\_iops}$ increases from $10^6$ to $5\times 10^6$, this term drops from $1\ \mu s$ to $0.2\ \mu s$, so the per-page benefit from higher IOPS is actually quite limited.
 
-* Seconds-Rule 策略：这是本工作重点研究的主要策略。其核心思想是在秒级时间尺度上跟踪访问行为，把在最近若干秒内持续活跃的一组数据定义为“热集”，优先放入 DRAM；而在这一时间尺度上显著沉寂的数据则更易被驱逐到 SSD。与单纯依赖“最近一次访问”或“长期累计频率”的策略相比，Seconds-Rule 更强调短周期内的持续活跃程度，目的是更敏锐地捕捉短时热点和阶段性访问模式，从而在相同 DRAM 配置下获得更好的延迟与召回权衡。
+For a given query $q$, let the total number of SSD pages actually accessed during the search be $N_{\text{pages}}(q)$, then the I/O latency of that query is approximated as: 
+$$
+L_{\text{io}}(q) = N_{\text{pages}}(q)\cdot t_{\text{page}}
+$$
+Here, $N_{\text{pages}}(q)$ comes from the combined effect of three factors: the set of clusters hit by the query, whether these clusters are currently in DRAM, and the actual sizes of the corresponding lists. In the implementation, we first determine which lists need to be scanned for this query based on $nprobe$ and the index structure, then for the lists that reside on SSD we count pages aligned to 4KB pages, and sum them to obtain $N_{\text{pages}}(q)$. The fields `avg_ssd_pages_mean` and `avg_ssd_bytes_mean` in the result files are the averages of $N_{\text{pages}}(q)$ and its corresponding bytes over all queries.
 
-在评价指标方面，实验重点关注以下几个维度，并在多种 DRAM 容量下对所有策略进行系统扫描
-* p95 延迟：用于衡量尾部请求的性能，而非简单平均值
-* I/O 放大量：用于描述逻辑上一次查询在底层存储层面触发了多少额外的读写操作
-* 数据迁移字节数：用于量化策略在 DRAM 与 SSD 之间移动数据所付出的成本；
-* 召回率与延迟：通过将不同配置的结果绘制在同一坐标系中，直观展示“更快”与“更准”之间的权衡；
-* 给定服务等级协议延迟约束下可达到的最大召回率：用于衡量在现实系统约束内各策略能够提供的最佳检索质量。
-这些指标组合在一起，构成了一个面向混合存储向量检索场景的系统级评价框架，可以较全面地回答“某个分层策略究竟好不好”这一问题。
+To separate ANN computation itself from I/O, we decompose total query latency into three parts: 
+$$
+L(q) = L_{\text{ann}}(q) + L_{\text{io}}(q) + L_{\text{fixed}}
+$$
+where: 
 
+* $L_{\text{ann}}(q)$: the computation time of IVF search itself, including coarse search (distance computation to centroids) and list scan (distance computation to candidate vectors) , recorded as `avg_ann_us` in the results
+* $L_{\text{io}}(q)$: the SSD page-level I/O time defined above, which is the main bottleneck we focus on
+* $L_{\text{fixed}}$: a small fixed overhead independent of the specific policy (scheduling, framework overhead, etc) . From the difference between `avg_latency_us` and `avg_ann_us` under all DRAM, we can see that $L_{\text{fixed}}$ is about $0.2\ \mu s$, which is negligible compared with millisecond-level SSD I/O
 
+The intuitive meaning of this model is: once a query falls onto SSD, overall latency is almost entirely determined by “how many pages were read”. Under our configuration, even if we increase $\text{max\_iops}$ from $10^6$ to $5\times 10^6$, the per-page cost only changes from $21\ \mu s$ to $20.2\ \mu s$, which is far less effective than “halving the number of pages that need to be read”. Therefore, for different policies and parameter combinations, comparing $p95$ latency is almost equivalent to comparing their average and tail SSD page counts, which is also why in subsequent analysis we heavily use I/O amplification and `avg_ssd_pages_mean` as intermediate indicators.
 
-### 0.3 实际成果
+### 4.3 Objective and Metrics
 
-实验流水线已经在 Linux/WSL2 环境中成功执行完成，并形成了一套可复现的输出结果。一次完整运行大致可以分为三个阶段：准备与初始化、请求回放与记录、结果汇总与可视化。
+Our optimization goal is not a single metric, but a multi-objective tradeoff problem: 
 
-在准备阶段，系统从统一的配置入口读取数据集位置、分层策略集合、DRAM 容量列表以及工作负载轨迹，对索引结构和模拟环境进行初始化。随后，在请求回放阶段，系统按照轨迹顺序逐条模拟查询，记录每一次访问命中 DRAM 还是 SSD、触发了多少次底层 I/O、产生了多少迁移，以及单次查询的端到端延迟。在这一阶段，所有原始事件和统计量都会以结构化方式写入中间结果。
+* Primary goals: under given hardware and DRAM constraints, achieve as much as possible high recall, low average latency, and low tail latency (especially p95) 
+* Secondary goals: while ensuring the primary metrics, reduce I/O amplification as much as possible, and control the additional costs introduced by cache migration
 
-在结果汇总与可视化阶段，流水线对原始记录进行聚合统计，并输出一组可直接用于分析的工件，包括：
+Therefore we do not compress everything into a single score, but explicitly analyze several core metrics. Below we explain the key metrics that appear in the result outputs one by one.
 
-* 一组 CSV 文件，既包含逐查询的原始数据，也包含按策略和 DRAM 容量聚合后的统计结果。例如，对于每一组配置，表中会给出平均延迟、第九十五百分位延迟、总 I/O 次数、I/O 放大量、数据迁移字节数以及召回率等指标。
+#### 4.3.1 Recall at $k$
 
-* 一组图像文件，对应聚合结果中的关键关系图。一部分图展示在不同 DRAM 容量下，各策略的 p95 延迟变化；另一部分图展示 I/O 放大量、迁移开销以及召回–延迟前沿等，用来直观体现“增加 DRAM 容量”或“更换分层策略”带来的系统行为变化。
-
-* 一份完整的日志文件，记录了实验运行过程中各阶段的状态，包括环境信息、配置参数、每个策略与容量组合的执行情况，以及可能出现的异常或警告。日志不仅为调试提供依据，也为第三方复现实验提供了必要的上下文。
-
-即使在不深入分析具体数值的前提下，这些结构化 CSV、图像和日志已经构成系统性成果：代码可以被执行，行为可以被量化，过程可以被复现。任何评审或后续研究者，只要在相似环境中加载同一份 Report Bundle，即可重新获得同样的输出，从而验证结果的稳定性和实验方法的可靠性。
-
-
-
-### 0.4 预期行为
-
-在一个设计合理的分层策略下，随着 DRAM 容量从低到高逐步提升，系统行为在宏观上应当表现出若干方向一致的趋势。这些预期不要求每个数据点都严格单调，但在整体上应当符合直觉和系统结构的基本约束。
-
-首先，p95 延迟应当随 DRAM 容量提高而整体下降。由于 DRAM 的访问延迟远低于 SSD，DRAM 容量增大后，可以容纳更多经常被访问的索引数据，查询命中 DRAM 的概率上升，对 SSD 的依赖减弱。尤其是在尾部请求上，更多原本可能触发多次随机 SSD 访问的查询，开始在 DRAM 中被满足，以较小的延迟完成。这样，大部分“最慢”的那一批请求会被显著“拉快”，从而使第九十五百分位延迟整体向下移动。即使在某些容量点附近因为负载波动或统计样本差异出现局部起伏，从整体趋势来看，曲线仍应保持明显的下降形态。
-
-其次，I/O 放大量应当随 DRAM 容量提高而整体降低。逻辑上，一个查询只需要访问有限数量的索引单元。如果这些单元在查询间被高效地缓存于 DRAM，底层 SSD 实际承担的 I/O 次数就会接近“刚好足够”的水平。反之，当 DRAM 空间不足时，即使多次访问的是同一片数据，因为无法长时间留在 DRAM，系统被迫反复从 SSD 读取同一个块，于是“为了一次查询发起过多 I/O”的现象会频繁出现。随着 DRAM 扩容，热点数据可以更稳定地留在内存中，重复访问不再转化为重复 I/O，放大量便会随之下降。
-
-再次，在相同的查询负载下，给定 SLA 延迟约束下可达的最大召回率应当随 DRAM 容量增加而提高。更大的 DRAM 并不直接改变向量空间的几何结构，但它改善了每次查询的时间预算分配。由于请求平均和尾部延迟下降，系统在相同 SLA 内可以进行更深、更广的检索，例如增加探测的候选数量、使用更精细的后过滤逻辑，或者采用更昂贵但更准确的重排步骤。这些额外的“计算余裕”通常可以换取更高的召回率。因此，当 DRAM 容量从低到高增长时，在同一个 SLA 门槛下，各策略理论上都有能力达到更高的召回水平。
-
-在比较不同策略时，不仅需要检查它们是否遵循上述趋势，还需要考察在同一 DRAM 容量和同一 SLA 要求下，谁能提供更好的权衡。一个好的分层策略应当具备如下特征：在相同的 DRAM 容量下，p95 延迟更低，或者在相同 p95 的前提下召回更高；在相同 SLA 下，能够达到的最大召回率更高；当把所有策略的结果绘制在同一坐标系中时，该策略对应的数据点整体更集中于“低延迟、高召回”的区域，形成一条更接近理想角点的前沿。这样的表现，构成判断实验结果是否合理、策略是否有效的重要依据。
-
-
-
-### 0.5 偏差度量
-
-为了将上述“预期趋势”转化为可执行、可复现的分析步骤，本工作给出了一组完全基于数据的偏差度量方法，可以直接在生成的 CSV 文件上计算，而不依赖主观目测。
-
-第一，单调性检查。对于每一种分层策略，将实验中的 DRAM 容量按从小到大排序，观察对应的 p95 延迟序列。如果在容量增加的地方出现 p95 上升的情况，则记录为一次单调性违背。对每一次违背，可以进一步记录上升幅度和相对于邻近点的比例。通过统计违背次数和幅度，可以判断曲线与“整体下降”这一预期的吻合程度，区分偶然的统计噪声和明显的异常行为。
-
-第二，与理想上界的差距。All-DRAM 策略可以视作在给定工作负载下的理想基准：它提供了最低的 p95 和最高的召回。对于任意策略和任意 DRAM 容量配置，可以定义与 All-DRAM 的差距，例如以某策略的 p95 减去 All-DRAM 的 p95，得到一个非负数值，表示在延迟上距离理想还有多少毫秒；或者以 All-DRAM 的召回减去该策略的召回，得到在召回上的差距。通过对这些差距在不同容量上的统计，可以直观地比较各策略“离最优还差多远”，也可以通过平均差距或最大差距来概括其总体表现。
-
-第三，SLA 差距。给定一个具体的 SLA 延迟门槛，例如某个毫秒级上限，可以对每种策略在所有 DRAM 容量配置下进行筛选，只保留实际 p95 不超过这一门槛的配置。在满足 SLA 的所有点中，选出召回率最高的一点，作为该策略在该 SLA 下的“可达召回”。不同策略在同一 SLA 下可达召回的差异，反映出它们在现实服务约束内能提供的最佳检索质量。如果需要从召回的角度反推延迟，也可以固定一个目标召回率，比较不同策略要达到这一水平各自需要的 p95，与 SLA 之间的差额便是另一种形式的“延迟差距”。
-
-通过这些偏差度量，可以把“曲线看起来还不错”这样的直观印象转化为具体数字：单调性被打破了多少次，与 All-DRAM 在延迟和召回上的差距有多大，在给定 SLA 下损失了多少本可以达到的召回。相关的计算公式以及示例代码将在后续章节中给出，以便读者直接在本次实验生成的 CSV 上复现同样的分析流程。
-
-
-## 1. 背景入门
-
-### 1.1 向量、距离和 k 近邻
-
-在向量检索（vector search）问题中，每一条数据（文档、图片、商品等）会先被一个模型编码成一个实数向量，可以把它想象成高维空间中的一个点。形式上可以写成：
+recall at $k$ is denoted as recall@$k$. For a single query $q$, it is defined as: 
 
 $$
-\mathbf{x} = (x_1, x_2, \dots, x_d) \in \mathbb{R}^d
+\text{recall@}k(q) = \frac{\#\{\text{vectors that are in the ANN returned top }k \text{ and also belong to the true top }k\}}{k}
 $$
 
-这里的 $d$ 是向量的维度，例如常见的有 $128$ 维、$512$ 维、$768$ 维等，取决于所用的 embedding 模型。
+Then taking the average over all queries gives the overall recall@k in the report. Its range is $0$ to $1$, and a higher value means “more of what should be retrieved is indeed retrieved”.
 
-数据库中会有很多这样的向量，构成一个集合：
+In the experiment, the true top $k$ is an “approximate ground truth” obtained by doing exact search over a smaller candidate set or by offline precomputation, the result files do not directly print $k$, but from the values of I/O amplification we can infer $k\approx 10$ (each vector is 128-dimensional, float32, so $10\times 128\times 4=5120$ bytes) , which also matches common ANN evaluation practice
 
-$$
-{\mathbf{x}_1, \mathbf{x}_2, \dots, \mathbf{x}_N}
-$$
+We use recall rather than precision because in ANN scenarios the top-$k$ returned results are fixed to $k$ items, precision and recall are highly related in form, and recall more directly reflects “whether the truly nearest neighbors were missed”.
 
-当用户发出一个查询（例如一句话、一个问题），系统先把它编码成一个查询向量：
+#### 4.3.2 Latency metrics
 
-$$
-\mathbf{q} \in \mathbb{R}^d
-$$
+Latency-related metrics mainly include three categories: 
 
-向量检索要解决的问题就是：在所有数据向量里，找到和 $\mathbf{q}$ 最接近的 $k$ 个向量。这一类问题通常叫做 k 最近邻搜索（k-NN）。
+* `avg_latency_us_mean`: average query latency, in microseconds ($\mu s$)
+* `p50_latency_us_mean`、`p95_latency_us_mean`、`p99_latency_us_mean`: latency at different percentiles
+* `avg_ann_us_mean`: average time of the ANN computation part (coarse search + list scan) 
 
-要比较“接近程度”，需要定义“距离”或“相似度”。常见的两种是：
+The average latency reflects overall throughput, p50 can be roughly understood as the latency of a “typical” query, p95、p99 characterize tail latency, which is the metric system design cares more about
 
-* 欧氏距离（L2 距离）：
+The definition of p95 is: sort the latencies of all queries from small to large, and take the value at the $95%$ position, that is, $95%$ of queries have latency no greater than this value. Online services commonly use p95 (or even p99) as an SLA constraint, because real users often encounter these “slightly slower requests”, rather than only seeing the average.
 
-$$
-d_{\text{L2}}(\mathbf{q}, \mathbf{x})
-= |\mathbf{q} - \mathbf{x}|*2
-= \sqrt{\sum*{i=1}^{d} (q_i - x_i)^2}
-$$
-
-* 余弦相似度（数值越大说明越相似）：
+`avg_ann_us_mean` only counts the computation overhead that still exists even under all DRAM. In our model, total latency can be roughly decomposed as: 
 
 $$
-\cos(\mathbf{q}, \mathbf{x})
-= \frac{\mathbf{q} \cdot \mathbf{x}}{|\mathbf{q}|_2 , |\mathbf{x}|_2}
+L(q) = L_{\text{ann}}(q) + L_{\text{io}}(q) + L_{\text{fixed}}
 $$
 
-在很多系统里，会把“相似度”转换成“距离”，例如用 $1 - \cos(\mathbf{q}, \mathbf{x})$ 之类，这样就可以统一用“距离越小越好”的语义。
+where $L_{\text{ann}}$ corresponds to `avg_ann_us_mean`, $L_{\text{io}}$ comes from SSD page-level I/O, and $L_{\text{fixed}}$ is a tiny constant of about $0.2\ \mu s$. By comparing all DRAM and SSD-involved policies, we can directly see that I/O pulls latency from microseconds up to milliseconds.
 
-形式上，k 近邻搜索可以写成：
+#### 4.3.3 SSD read volume and pages
 
-$$
-\text{kNN}(\mathbf{q})
-= \arg\min_{\mathcal{S} \subset {1,\dots,N},,|\mathcal{S}|=k}
-\sum_{i \in \mathcal{S}} d(\mathbf{q}, \mathbf{x}_i)
-$$
+SSD read volume related metrics mainly include: 
 
-直观理解就是：在所有数据点里，选出离查询点 $\mathbf{q}$ 最近的 $k$ 个点。
+* `avg_ssd_pages_mean`: average number of pages read from SSD per query
+* `avg_ssd_bytes_mean`: average bytes read from SSD per query
 
-如果做“精确搜索”，最直接的做法是：对所有 $N$ 个向量都算一次距离，算完之后排序，取前 $k$ 个
-这种方法的计算复杂度大致可以写成：
+The relationship between the two depends on page size. In the experiment we use 4KB pages, so we have: 
 
 $$
-O(N \cdot d)
+\text{bytes} = \text{pages} \cdot 4096
 $$
 
-当 $N$ 达到几百万、几亿，甚至更大时，每次查询都对全部向量做距离计算，延迟会非常高，根本无法支持实时在线服务。
-
-因此，实际系统中普遍采用的是 近似最近邻搜索（Approximate Nearest Neighbor, ANN）：
-允许结果和“真正的精确 top-$k$”之间有一点点误差，用少量精度损失换取巨大的性能提升。
-
-常见的精度指标是 $\text{recall@}k$，定义为：
+`avg_ssd_pages_mean` is a very key intermediate quantity, because under our page-level latency model, I/O latency is almost a linear function of page count: 
 
 $$
-\text{recall@}k
-= \frac{\text{返回结果中真正属于精确 top-}k\text{ 的个数}}{k}
+L_{\text{io}}(q) = N_{\text{pages}}(q)\cdot t_{\text{page}}
 $$
 
-当 $\text{recall@}k$ 接近 $1$ 时，说明近似方法和精确搜索几乎一样，但查询速度往往快了好几倍甚至一个数量级。
+That is, as long as a policy causes queries to trigger more SSD page reads, p95 will almost linearly worsen; conversely, as long as it can reduce the average and tail page counts, it can significantly improve tail latency. `avg_ssd_bytes_mean` helps us intuitively feel from a byte perspective “how much data each query is scanning on SSD”.
 
+#### 4.3.4 I/O amplification
 
+`avg_io_amplification_mean` denotes I/O amplification (IOAmp) , used to measure how much extra “useless data that was scanned along the way” the system actually reads from SSD in order to obtain the small top $k$ set of truly useful data.
 
-### 1.2 IVF：倒排文件索引
-
-要让 ANN 快起来，需要利用专门的索引结构。本项目使用的是一类非常常见的结构：IVF（Inverted File）倒排文件索引。
-
-直观上，可以把 IVF 理解成“先把空间切成很多桶，再只检查和查询最相关的几个桶”。
-
-#### 1.2.1 建索引
-
-第一步是对向量空间做聚类，得到若干个簇中心。设有 $n_{\text{list}}$ 个簇中心：
+Formally it can be written as: 
 
 $$
-{\mathbf{c}*1, \mathbf{c}*2, \dots, \mathbf{c}*{n*{\text{list}}}}
+\text{IOAmp} = \frac{\text{SSD bytes read per query}}{\text{useful bytes per query}}
 $$
 
-对于数据库中每一个向量 $\mathbf{x}$，找到离它最近的那个簇中心：
+where the denominator $\text{useful bytes per query}$ can be approximated as: 
 
 $$
-j^*(\mathbf{x})
-= \arg\min_{1 \le j \le n_{\text{list}}} d(\mathbf{x}, \mathbf{c}_j)
+\text{useful bytes per query} \approx k \times d \times \text{sizeof}(\text{float})
 $$
 
-然后，就把这个向量 $\mathbf{x}$ 放进第 $j^*(\mathbf{x})$ 个簇对应的倒排链表（也叫 inverted list），记为 $L_{j^*(\mathbf{x})}$。
-最终会得到很多个倒排链表：
+In this project’s configuration, $d\approx 128$、$\text{sizeof}(\text{float})=4$, and $k\approx 10$, so the useful data is about $5120$ bytes.
+
+Take the default workload with all SSD and $nprobe=1$ as an example, the results give: 
+
+* `avg_ssd_bytes_mean ≈ 179703.808` bytes
+* `avg_io_amplification_mean ≈ 35.0984`
+
+Thus we can infer: 
 
 $$
-L_1, L_2, \dots, L_{n_{\text{list}}}
+\text{useful bytes} = \frac{179703.808}{35.0984} \approx 5120
 $$
 
-每个链表里存放的是“更接近同一个中心点”的那一堆向量，可以理解为一个“向量桶”。
+This matches $10\times 128\times 4$ exactly. Therefore IOAmp can be explained as obtain about 5KB of truly useful results, each query on average must read about 170KB of data from SSD, amplifying by about $35$ times
 
-#### 1.2.2 查询
+The larger IOAmp is, the more useless data is “incidentally scanned” on SSD, and in scenarios where random I/O cost is very high, this almost directly translates into higher latency, especially p95 and p99. Compared with looking only at `avg_ssd_bytes_mean`, IOAmp normalizes results to the dimension of “how much physical I/O must be paid per byte of useful data”, making it easier to compare across datasets and across $k$.
 
-当有查询向量 $\mathbf{q}$ 时，不再对所有向量做距离计算，而是分两步：
+#### 4.3.5 Migration metrics
 
-* 先计算 $\mathbf{q}$ 对所有簇中心的距离，找到最接近的 $n_{\text{probe}}$ 个簇：
+Migration-related fields characterize how much data different policies actually moved during execution in order to chase hotspots and adjust the residency set, and how much extra time was spent on this. They mainly include: 
 
-   $$
-   \mathcal{P}(\mathbf{q})
-   = { j_1, j_2, \dots, j_{n_{\text{probe}}} }
-   $$
+* `total_migration_bytes_mean`: total migrated bytes over the entire experiment
+* `migration_bytes_per_query_mean`: total migrated bytes divided by the number of queries, normalized to “how many extra bytes are moved on average per query for maintaining the policy”
+* `total_migration_time_us_mean`: total time spent on migration operations (in microseconds) 
+* `migration_time_us_per_query_mean`: average migration time per query
+* `avg_migrated_clusters_per_rebalance_mean`: average number of clusters (lists) migrated per rebalance
 
-* 只在这些簇对应的倒排链表
+It should be emphasized that migration itself does not directly show up in the latency of a single query: in many real systems, migration can be done slowly in the background, or performed in batches during low load, so looking only at query p95 can easily ignore this maintenance cost. But in engineering practice, migration will: 
 
-   $$
-   L_{j_1} \cup L_{j_2} \cup \dots \cup L_{j_{n_{\text{probe}}}}
-   $$
+* consume SSD bandwidth, competing with online queries for I/O capability
+* consume CPU for data copying and metadata updates
+* trigger extra cache writes and invalidations
 
-   中做更精细的距离计算和排序，从而得到近似的 top-$k$ 结果。
+Therefore we explicitly track migrated bytes and migration time in the results, with the purpose of presenting the question of “whether a policy is worth it” in a complete way: even if a policy can reduce p95 by a few hundred microseconds on the query dimension, if the cost is moving several GB of data and continuously occupying SSD bandwidth, it may not be a better choice in a real system. By comparing `migration_bytes_per_query_mean` with latency improvements, we can more clearly see the differences among policies in “benefit / cost”.
 
-这样一来，每次查询需要检查的候选向量数目，就从原来的 $N$，降到了远小于 $N$ 的一个数（取决于 $n_{\text{list}}$、$n_{\text{probe}}$ 和每个列表的长度），这就是 IVF 能够加速 ANN 的核心原因。
+## 5. Policy Design
 
-#### 1.2.3 Faiss 是什么，为什么要提到它
+In this project, all policies are in fact revolving around the same core question: under a given upper bound of DRAM capacity, which clusters’ IVF lists should reside permanently in DRAM, and which should remain on SSD. The ANN algorithm itself (the IVF structure, distance computation method, nprobe values, etc) is completely identical across different policies, what changes is only the decision logic of “which tier the list resides in”, and how that decision affects recall, latency, I/O amplification, and migration cost.
 
-IVF 不是一个孤立的概念，而是集成在具体的向量检索库中使用的。
-其中最重要、最常被提到的一个库叫 Faiss：
+In other words, we did not “invent a new ANN”, but under a fixed ANN engine, we study how different caching policies shape the performance of the same engine.
 
-* 由 Meta 开源；
-* 专门用于大规模相似度搜索和密集向量的聚类；
-* 核心实现使用 C++，同时提供 Python 接口；
-* 内部实现了多种索引结构，包括 IVF、HNSW、PQ（产品量化）、IVF-PQ 等。
+### 5.1 Baseline Policies
 
-可以简单地把 Faiss 理解为一个已经帮你写好、并高度优化好的向量检索引擎，可以直接拿来做 ANN
+To provide a “coordinate system” for later comparisons, we first define several baselines. The two extremes all DRAM and all SSD provide an “ideal upper bound” and a “worst lower bound” respectively, while LRU, naive LFU, and window LFU represent several classic caching ideas.
 
+#### 5.1.1 all DRAM
 
-### 1.3 为什么要用混合 DRAM + SSD
+all DRAM assumes that all IVF lists fully reside in DRAM. For each query, after nprobe selects several clusters, the list scans of these clusters all happen in memory, without any SSD reads. In this case, the system’s query latency is almost entirely determined by the ANN search itself, namely the computation time of the coarse search stage (coarse search) and the fine search stage (list scan) , plus a very small fixed overhead. In the experimental results, we can see that under this configuration avg_latency_us and avg_ann_us are very close, and their difference is only on the order of about $0.2$ microseconds.
 
-理解分层策略之前，需要先看清楚两种典型硬件的特点。
+Given nprobe, all DRAM also provides the highest achievable recall. Because there is no I/O constraint and no missed scans caused by cache mistakes, ANN only “loses to approximation”, and will not additionally “lose to I/O”. Therefore all DRAM can be regarded as “under the same IVF configuration + the same nprobe, the truly reachable upper bound of performance and accuracy”, and all DRAM+SSD based policies later are moving toward this point, but cannot surpass it.
 
-* DRAM（内存）：访问速度非常快，可以在纳秒级完成一次随机访问，但容量有限、价格昂贵。
-* SSD（固态硬盘）：容量大得多、单位容量成本低很多，但随机访问延迟比 DRAM 高出几百到几千倍，通常是微秒到毫秒级。
+#### 5.1.2 all SSD
 
-可以用一个极简化的公式来近似表达一次查询的时间：
+all SSD is the other extreme: all IVF lists are stored on SSD, and DRAM caches no list. For each query, as long as nprobe selects a cluster, the corresponding list must be read from SSD and then participates in computation. Here there is no notion of hit or miss, and there is no migration decision either, DRAM is only viewed as a “mandatory buffer during computation”.
 
+Under this configuration, we can clearly see several things. First, under the current data scale, list sizes, and nprobe settings, how many pages and how many bytes a query needs to read from SSD on average, which is directly reflected in avg_ssd_pages and avg_ssd_bytes. Second, to obtain only that small amount of “useful data” of top-$k$, how much extra data the system actually reads from SSD, which is reflected by I/O amplification (avg_io_amplification) . Third, once SSD I/O is involved, to what magnitude query latency is pulled, which can be directly seen from millisecond-level p95.
+
+In our experiments, the p95 of all DRAM is usually a few microseconds to a dozen microseconds, while the p95 of all SSD is a few milliseconds to over ten milliseconds, differing by two orders of magnitude. This also indicates from another angle: as long as part of the lists are placed on SSD, SSD reads are the main determinant of tail latency. All subsequent caching policies can be understood as searching for a tradeoff point between the two endpoints all DRAM and all SSD: use limited DRAM to reduce SSD reads as much as possible, while keeping migration cost under control.
+
+#### 5.1.3 LRU
+
+In this project, LRU (Least Recently Used) maintains recency information at the “cluster” granularity. We can view the set of clusters currently residing in DRAM as an ordered linked list or queue: the tail represents “clusters accessed most recently”, and the head represents “clusters not accessed for the longest time”.
+
+Each time a query hits a cluster $c$, if $c$ is already in DRAM, we move it to the tail, indicating it is the most recently used object; if $c$ is not in DRAM, then we decide according to the policy whether to migrate $c$’s list from SSD into DRAM. If migration is needed and DRAM is already full, we evict one cluster from the head that has been unused for the longest time, and treat its list as residing only on SSD. This “move to tail” and “evict from head” forms the typical LRU behavior.
+
+The biggest advantage of this policy is that it is very sensitive to hotspot changes. If some clusters suddenly become very hot in a recent period, they will immediately move to the tail and stably remain in DRAM; as long as a cluster has not been accessed recently, even if it was historically very hot it will gradually slide to the head and eventually be evicted. The disadvantages are also very typical: once there is a one-off “full-database sweep”, a large number of clusters are accessed once within a short time, and the true hot clusters may be squeezed out of DRAM by these one-time accesses, this is the so-called cache pollution. In addition, under workloads where hotspots switch frequently, LRU may be very “restless”: a new hotspot just enters, an old hotspot that was just evicted may become hot again soon, so it has to be migrated back, leading to very considerable migration counts and migrated bytes.
+
+From the experimental results, we can see that under workloads where hotspots change very fast, LRU often achieves relatively good reductions in I/O amplification and p95 latency, but the corresponding migration_bytes is often the largest among all policies, reflecting the characteristic of “diligently chasing hotspots, but also moving house very frequently”..
+
+#### 5.1.4 naive LFU
+
+naive LFU (Least Frequently Used) uses the dimension of “access count” to judge whether a cluster is worth residing in DRAM. For each cluster $c$, we maintain an access counter $\text{cnt}(c)$. Each time a query hits cluster $c$, we increment $\text{cnt}(c)$ by one; when we need to free space in DRAM, we preferentially evict clusters with the smallest counters, leaving their lists on SSD.
+
+Intuitively, clusters with higher access counts are more likely to be long-term hotspots, and should be prioritized to stay in DRAM; clusters that appear only once or twice are likely just local noise or tail data touched by some random scan, and are not worth occupying memory long-term. This idea is often very effective in systems where hotspot patterns are relatively stable.
+
+But naive LFU has a fatal engineering flaw: the counts “accumulate without bound”. Clusters that were extremely popular early on but have already “cooled down” later may still occupy DRAM because their historical access counts are too high; while newly emerged hotspot clusters, even if they are very active recently, still find it hard in the short term to catch up to the old hotspots’ counts. As a result, the system behaves as “vengeful but not forgetful”: historical hotspots consume most of DRAM capacity, and new hotspots are repeatedly read from SSD but still cannot squeeze in for a long time.
+
+We can also see this in our experiments: in scenarios where hotspots move very slowly, or where the Zipf-style distribution is very extreme, naive LFU performs reasonably well, because the small portion of truly hot clusters remain hot over a long period, and the counts do accurately reflect their importance. But under workloads where hotspots change quickly, naive LFU’s ability to chase hotspots is far worse than LRU or seconds rule, the reduction in I/O amplification is very limited, and p95 cannot be driven down.
+
+#### 5.1.5 window LFU
+
+window LFU can be seen as a version of naive LFU “with a forgetting mechanism”. The core idea is: only count frequency within the most recent “time window”, and ignore all history outside the window. In this way, the system will not be held hostage by “hotspots from a long time ago”, but instead pays more attention to clusters that are truly active in the current period.
+
+There can be different implementation choices. One is a strict sliding window: for example, only count how many times each cluster is accessed in the most recent $W$ queries, and as the window slides forward, old statistics are discarded. Another implementation is more engineering-friendly, using exponential decay to approximate a sliding window: for each cluster $c$ maintain a score $\text{score}(c)$, and on each access perform
 $$
-T_{\text{query}}= T_{\text{CPU}} + n_{\text{DRAM}} \cdot t_{\text{DRAM}} + n_{\text{SSD}} \cdot t_{\text{SSD}}
+\text{score}(c) \leftarrow \alpha \cdot \text{score}(c) + 1,
 $$
+where $0 < \alpha < 1$.Thus, if a cluster is not accessed for a long time, its $\text{score}(c)$ will automatically decay to a very low level, and even if it was once very hot, it will gradually lose priority.
 
-其中：
-* $n_{\text{DRAM}}$：该次查询从 DRAM 读取的次数；
-* $n_{\text{SSD}}$：该次查询从 SSD 读取的次数；
-* $t_{\text{DRAM}}$：一次 DRAM 访问的平均延迟；
-* $t_{\text{SSD}}$：一次 SSD 访问的平均延迟，通常远大于 $t_{\text{DRAM}}$。
+In the experimental results of this project, window LFU is almost always more stable and more engineering-friendly than naive LFU. On the one hand, it can better adapt to hotspot changes, reducing the influence of “historical baggage”, and under multiple workloads it can reduce I/O amplification and p95 a bit further than naive LFU; on the other hand, its migration overhead usually stays at a medium level, and will not show hundreds of MB or several GB of migration volume like LRU or seconds rule. Therefore, if a real system can only choose one frequency-based policy as the default, window LFU is usually more suitable than naive LFU.
 
-现实中基本可以认为：
+### 5.2 Seconds Rule Policy
 
+The perspective of seconds rule is clearly different from the previous policies: it does not focus on “whether it was accessed recently” or “how many times it was accessed”, but on the “reuse interval”——that is, the time difference or query-step difference between two accesses.
+
+For each cluster $c$, we record the timestamp or query index of its last access $t_{\text{last}}(c)$. The current query occurs at “time” $t$ (in the actual implementation, $t$ can be approximated by “which query number”) , then the reuse interval of this access is defined as
 $$
-t_{\text{SSD}} \gg t_{\text{DRAM}}
-$$
-
-这意味着哪怕 $n_{\text{SSD}}$ 很小，只要存在几次随机 SSD 访问，就有可能主导整次查询的尾部延迟。
-尤其是在 p95、p99 这类尾延迟指标上，少数“需要多次 SSD 访问”的请求会把整体尾部拉得很高。
-
-在大规模 ANN 系统中，向量和索引的总大小往往很难完全放进 DRAM。
-如果强行把全部索引放在 DRAM 中，延迟会非常好，但机器成本会非常夸张，甚至单机根本放不下。
-如果把索引完全放在 SSD 上，成本可控，但延迟和尾延迟会明显恶化，很难满足在线业务的 SLA。
-
-因此，一个折中方案是采用 混合 DRAM+SSD 的分层存储。可以做这样一个抽象：
-给定一个 DRAM 容量限制 $C_{\text{DRAM}}$，需要从所有数据中挑选一部分放到 DRAM 中，其余放在 SSD 上：
-
-$$
-\text{给定容量约束 } C_{\text{DRAM}},\quad
-\text{寻找一个集合 } S_{\text{DRAM}} \subseteq \text{AllData}
-$$
-
-使得：
-
-$$
-\text{Size}(S_{\text{DRAM}}) \le C_{\text{DRAM}}
-$$
-
-并在这个约束下，尽量优化以下目标：
-
-* 对于每次查询，尽量减小 $n_{\text{SSD}}$，从而降低 $T_{\text{query}}$，尤其是尾部的 $T_{\text{query}}$；
-* 控制 DRAM 与 SSD 之间的数据迁移成本，不要频繁搬来搬去导致额外 I/O。
-
-现代的磁盘化/混合化 ANN 系统，例如 DiskANN、SPANN 等，都是在这个“内存 vs SSD”的权衡框架下设计的，只不过采用的索引结构不同、分层策略不同。
-
-
-
-### 1.4 Seconds-Rule 的直觉
-
-在缓存与存储系统领域，有一个非常经典的法则，叫 “五分钟法则（five-minute rule）”。
-它的核心思想是：比较“把某页数据常驻内存”与“每次需要时都从磁盘读一次”这两种方案的经济成本，从而推导出一个“值得缓存”的重用时间阈值。
-
-用一个极简化的模型来表示：
-
-* 假设把某页数据放在内存里的成本（单位时间）为 $C_{\text{mem}}$；
-* 每次从磁盘读取这页数据的成本为 $C_{\text{io}}$；
-* 这页数据的平均重用间隔为 $\Delta T$ 。
-
-如果这页数据常驻内存，那么单位时间的成本大致是：
-
-$$
-\text{Cost}*{\text{mem}} \approx C*{\text{mem}}
+\Delta t(c) = t - t_{\text{last}}(c).
 $$
 
-如果完全不缓存，每次都从磁盘读，那么在平均每 $\Delta T$ 秒访问一次的前提下，单位时间因 I/O 产生的成本大致是：
+seconds rule uses a threshold $\theta$ to distinguish “short reuse” and “long reuse”. If $\Delta t(c) \le \theta$, it indicates this cluster is repeatedly accessed within a relatively short time, so it closely resembles a part of the current hotspot and is worth being placed in DRAM; if $\Delta t(c) > \theta$, it indicates that a long time has passed between two accesses, and even if this cluster has appeared multiple times before, it is more like cold data and can remain on SSD. Through such a threshold, the policy distinguishes “short-interval reuse” (short-term locality) from “long-interval reuse” (historical residue) .
+
+In practical implementation, a simplified workflow can be as follows: during initialization, we can first select a batch of clusters to place in DRAM by some simple method, or simply start from empty and learn gradually. Afterwards, each time a query hits cluster $c$, we first compute the current $\Delta t(c)$, if the reuse interval is less than or equal to the threshold, we boost $c$’s priority; if $c$ is not in DRAM, we try to migrate it into DRAM. If DRAM is full at this time, we evict one cluster with the “lowest value” according to some priority rule. Meanwhile, we update $t_{\text{last}}(c)$ to record the new time for the next access.
+
+Behaviorally, seconds rule lies between LRU and LFU. Compared with LFU, it is more sensitive to “short-term repeated access”, and is not overly constrained by distant history; compared with LRU, it does not only look at “whether it came recently”, but precisely distinguishes “came many times recently” from “came once after a long interval”. In scenarios where hotspots change very fast, this sensitivity to short reuse often helps the policy quickly catch up with current hotspots, switching most active clusters to DRAM, thereby significantly reducing I/O amplification and p95.
+
+However, the cost is also clear: seconds rule is often more “aggressive” than window LFU and naive LFU, and will migrate frequently when cluster hotspots switch back and forth, once the list is large, such migration imposes very real pressure on SSD bandwidth and CPU resources. In the experimental results, we can see that under the hotspot fast-fast workload, seconds rule’s `migration_bytes` is usually on the order of tens of MB or even hundreds of MB, far higher than frequency-based policies; under some parameter combinations, although it further reduces I/O amplification, the migration cost has already become so high that it is difficult to directly transplant into a real system.
+
+### 5.3 Complexity and Implementation Notes
+
+From an engineering implementation perspective, this project intentionally designs the cache granularity as “cluster-level IVF lists”, rather than finer-grained “blocks within a list” or “per-vector”. A direct benefit of this is that the metadata scale is controllable: assuming the number of clusters is $nlist$, regardless of which policy is used, we only need to maintain one piece of state for each of these $nlist$ clusters.
+
+For LRU, we need to maintain for each cluster a position in a doubly linked list or an index in a queue, the overall metadata size is $O(nlist)$, and each access to a cluster only requires $O(1)$ linked-list operations. For LFU, we need to maintain access counts (and possibly a heap structure or a layered counting structure) , the metadata is also $O(nlist)$; window LFU additionally maintains window information or a decay factor on top of that, and the complexity remains $O(nlist)$. seconds rule needs to store for each cluster the last access time $t_{\text{last}}(c)$ and a priority score, used to evict clusters with “very long reuse intervals” when DRAM is full, and it is also maintained at the $O(nlist)$ scale.
+
+What can easily “run out of control” is in fact migration cost. List sizes across different clusters often differ greatly: some clusters’ lists contain only a few hundred vectors, while some clusters may gather over a thousand or even more vectors. Migrating a small list can be negligible, while migrating a huge list may consume a large amount SSD bandwidth and memory copy time in a single operation. If a policy happens to be particularly sensitive to such “giant lists”, and frequently pulls them from SSD into DRAM and then throws them out across different phases, `migration_bytes` and `migration_time` will soar.
+
+The huge differences in migrated bytes across different workloads in the experimental results are exactly the combined effect of “list size distribution” and “policy migration behavior”. This also reminds us that when discussing the pros and cons of policies we cannot only stare at “hit rate” or “whether p95 becomes smaller”, but must jointly examine three dimensions: whether I/O amplification is significantly reduced, whether migration cost is acceptable, and whether the entire scheme truly falls within the feasible region under the target SLA. In real engineering systems, it is very likely that migration rate or budget limits still need to be set, for example “at most how many MB can be migrated per second”, or compute cost-effectiveness indicators such as “SSD bytes saved per byte migrated” for each migration action, so as to avoid policies like seconds rule and LRU under extreme workloads “chasing hotspots until they migrate themselves to collapse”.
+
+
+
+## 6. Methodology
+
+### 6.1 Datasets
+
+This project uses SIFT vector data as the experimental object. Based on the back-inference from I/O amplification results, we can determine that the vector dimension is $128$, and `float32` storage is used, which is consistent with the classic SIFT configuration. We denote the database vectors as
+$$
+X \in \mathbb{R}^{N \times 128},
+$$
+and call it the base set; denote the query vectors as
+$$
+Q \in \mathbb{R}^{M \times 128},
+$$
+and call it the query set. All index construction, search, and statistics in the experiments are performed on this pair $(X, Q)$, the ANN engine only changes the index structure and tiering policy, and does not change the underlying vectors themselves, thus ensuring that different policies are compared under exactly the same data conditions.
+
+### 6.2 Workloads
+
+To cover different access patterns, we construct five workloads, each corresponding to an independent run directory. The directory for the default workload is
+`results/sr_sift_default_fast_20251215_135028`, 
+the fast-changing hotspot workload uses
+`results/sr_sift_exp_hotspot_fast_fast_20251215_135028`, 
+the slow-changing hotspot workload uses
+`results/sr_sift_exp_hotspot_slow_fast_20251215_135028`, 
+the uniform-distribution workload uses
+`results/sr_sift_exp_uniform_fast_20251215_135028`, 
+and the Zipf distribution (parameter $s=1.2$) workload uses
+`results/sr_sift_exp_zipf_s1.2_fast_20251215_135028`.
+
+The differences among these workloads are mainly reflected in the different “probability distributions of queries landing on each cluster”: the uniform workload approximates that each cluster has a similar access probability; the Zipf workload makes a small number of clusters bear most accesses, forming a long tail; the two hotspot workloads explicitly construct a “hot cluster set”, so that queries concentrate on this set for a period of time, and as time progresses continuously switch the hotspot set, where fast / slow controls the speed of hotspot movement. The default workload can be understood as a “mild” distribution between real traffic and an ideal model, used as a control group for the other workloads.
+
+### 6.3 Parameter Sweep
+
+Under each workload, we conduct a systematic parameter sweep over key system parameters, so as to observe performance tradeoffs under different combinations. DRAM capacity ratio (denoted as dram fraction) takes
+$$
+{0.05, 0.1 , 0.2}
+$$
+representing that DRAM can hold at most $5%$ or $20%$ of all IVF lists. The number of probed clusters $nprobe$ takes
+$$
+{1, 2, 4,8, 16,32}
+$$
+covering different intensities from “very few candidates, low I/O, high miss recall” to “sufficient candidates, obvious I/O amplification”. The SSD maximum IOPS is denoted as $\text{max\_iops}$, the default workload tests both
+$$
+10^6,\quad 5\times 10^6,
+$$
+while the other four workloads, to control experimental scale, only test
+$$
+5\times 10^6.
+$$
+
+For each $(\text{workload}, \text{dram fraction}, nprobe, \text{max\_iops})$ combination, we uniformly run a set of policies, including `all_dram`、`all_ssd`、`lru`、`naive_lfu`、`window_lfu` and `seconds_rule`. All policies share the same query sequence, the same underlying IVF structure, and the same SSD latency model, thus ensuring that the comparison among different policies is a clean control of “only changing the policy, changing nothing else”.
+
+### 6.4 Experimental Pipeline
+
+From the directory structure under `results/`, we can infer that the experimental pipeline consists of several stable steps. First, for each run (that is, a specific workload and parameter combination) , the online search process continuously records raw statistics and writes them into `raw/ann_policy_raw.csv`, this level of data retains the finest-grained metrics, such as per-query latency, SSD pages, and migration behavior.
+
+Second, we aggregate the raw data to generate `agg/ann_policy_agg.csv`. In this step, we summarize various means, standard deviations, and confidence-interval fields by “policy × configuration”; at the same time, based on the relationship between latency and recall we additionally export `agg/sla_reachable_recall.csv`, used to analyze the maximum recall each policy can achieve under a given SLA. In the current experiment `num_seeds = 1`, so the standard deviation and confidence-interval fields are $0$, and these aggregated values can be understood as “the observation point under this one random seed”, if more seeds are added in the future, the same pipeline can directly produce more rigorous statistical results.
+
+The third step automatically generates a series of visualization charts based on the aggregated `agg/` data, and saves them in the `figures/` directory. They mainly include: curves of p95 latency varying with DRAM ratio and IOPS, the relationship between I/O amplification and DRAM ratio, migration overhead varying with policy and configuration, and recall–latency frontier curves, and so on. These charts are the main basis for the subsequent result analysis writing (Section 7) .
+
+Finally, the script generates a batch of tables and Markdown snippets under the `report_assets/` directory, such as a key-point summary table and an SLA reachability table, to facilitate stitching into a more complete master report. In the current version of this work, we mainly “manually read `agg/` and the charts, then write the analysis”, but the entire pipeline already supports one-click generation of report assets in a unified style from raw statistics, laying a foundation for future experiment expansion or reproduction of experimental results.
+
+
+## 7. Results
+
+This section presents results and analysis based on the experimental outputs (COMPACT summary + figures under each run directory) . We focus on four categories of metrics: 
+
+* **p95 latency (μs)**: tail query latency (the smaller the better) .
+* **recall@k**: recall (the larger the better) .
+* **avg_io_amplification (IOAmp)**: the degree of SSD I/O amplification triggered by each query (the smaller the better) . It is highly correlated with “how many SSD pages/how much list data each query needs to read”.
+* **total_migration_bytes**: the cumulative number of bytes of list data migrated between SSD↔DRAM by a policy during execution (the smaller, the more “economical in movement/more stable”) .
+
+Experimental variables include: 
+
+* `nprobe ∈ [1, 32]` (number of IVF lists scanned; larger values give higher recall but typically larger I/O and latency) 
+* `dram_fraction ∈ {0.05, 0.1, 0.2}`
+* `max_iops ∈ {1M, 5M}`
+* policy: `all_dram, all_ssd, naive_lfu, window_lfu, seconds_rule, lru`
+
+### 7.1 Overall observations
+
+#### 7.1.1 The essential role of nprobe: trading I/O for recall
+
+In all workloads, increasing `nprobe` will drive: 
+
+* recall to increase monotonically (more lists are scanned, and the probability of hitting true neighbors becomes larger) 
+* p95 latency to increase (more lists scanned → more pages read → larger I/O amplification) 
+
+Therefore the system exhibits a very typical recall–latency frontier: a curve from low-latency/low-recall (small nprobe) to high-latency/high-recall (large nprobe) .
+
+#### 7.1.2 In SSD scenarios, tail latency is almost determined by “how many pages are read”
+
+When lists need to be read from SSD, p95 latency quickly rises to the millisecond level, and shows a strongly positive relationship with IOAmp / avg_ssd_pages: 
+
+* IOAmp decreases → fewer SSD pages read per query → lower p95
+* IOAmp increases (for example when nprobe becomes larger) → more pages → higher p95
+
+#### 7.1.3 The essence of “policy benefit” is a tradeoff between two things
+
+When comparing different caching policies, the core is to look at two chains: 
+
+* Hit-benefit chain: can the policy place “lists that will be accessed” into DRAM → do SSD pages decrease → does p95 decrease
+* Cost chain: does the policy need frequent migration in order to chase hotspots → does `total_migration_bytes` explode (which introduces engineering costs, write amplification, resource usage, etc) 
+
+### 7.2 Default workload
+
+Run directory: `results/sr_sift_default_fast_20251215_135028`
+
+#### 7.2.1 Key numbers from COMPACT output (max_iops=5M, nprobe=1)
+
+The table below directly picks the COMPACT numbers from the aggregated result files (units: p95 = μs; migration = bytes converted to MB for readability).
+
+##### dram_fraction = 0.05
+
+| policy       | p95 (μs) | recall | IOAmp | total_migration_bytes |
+| ------------ | -------: | -----: | ----: | --------------------: |
+| all_dram     |     2.42 | 0.5293 |  0.00 |                     0 |
+| all_ssd      |  1416.22 | 0.5293 | 35.10 |                     0 |
+| naive_lfu    |  1274.82 | 0.5293 | 30.97 |              ~8.60 MB |
+| window_lfu   |  1274.82 | 0.5293 | 31.13 |             ~24.42 MB |
+| seconds_rule |  1335.42 | 0.5293 | 31.94 |             ~78.61 MB |
+| lru          |  1335.42 | 0.5293 | 32.60 |            ~104.57 MB |
+
+**Observations and explanations: **
+
+* `all_dram` puts all data into DRAM, so p95 is only ~2.4 μs (pure compute/memory-access path) .
+* `all_ssd` has IOAmp ~35, meaning each query triggers a considerable number of SSD page reads, so p95 jumps to ~1.4 ms.
+* `naive_lfu/window_lfu` significantly reduce IOAmp (~31) , and p95 drops to ~1.27 ms: this shows they can keep part of the “commonly used lists” in DRAM, thus reducing SSD pages.
+* `seconds_rule/lru` do not show clearly better IOAmp and p95 than the LFU family, but have larger migration volume: this indicates that under this workload, the extra movement spent on chasing hotspots does not translate into proportional hit benefits.
+* After DRAM increases from 0.05 → 0.2, LFU-family IOAmp drops from ~31 to ~21.6, and p95 from ~1.27 ms to ~1.09 ms.
+* Increasing DRAM indeed significantly reduces SSD page reads, but still cannot bring tail latency back to the microsecond level (because a substantial portion of list accesses still fall on SSD) .
+* Under DRAM=0.2, `lru/seconds_rule` see clearly higher migration volume (hundreds of MB) but IOAmp is not better than LFU: this indicates they pay more movement to chase “temporal locality”, but the hit benefits are not proportional.
+
+#### 7.2.2 Behavior as nprobe increases from 1 to 32
+
+In the default workload, increasing `nprobe` brings two synchronous changes: 
+
+* **recall increases**: points on the frontier plot move along the curve toward “higher recall”
+* **p95 increases**: under the same policy, points move to the right (higher latency) 
+
+`nprobe` determines the number of lists scanned; scanning more lists linearly increases the total number of list entries that must be accessed, thereby pushing up SSD page count and IOAmp.
+Thus in policies that involve SSD paths, the cost of `nprobe` is amplified more noticeably than in all_dram.
+
+#### 7.2.3 SLA reachable recall (200 μs / 500 μs) 
+
+According to the SLA result plots/tables for this run: under the given SLA thresholds, only the pure DRAM path can choose a valid `best_nprobe` and achieve non-zero reachable recall; policies involving SSD are unreachable under these SLAs (appearing as `best_nprobe = -1`, reachable recall = 0) .
+
+As long as the tail of queries still reads SSD pages, p95 will fall in the millisecond range, and it is very hard to squeeze it within a few hundred microseconds.
+
+#### 7.2.4 Figures
+
+**IO amplification**
+![](results/sr_sift_default_fast_20251215_135028/figures/io_amp_vs_dram_iops1M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/io_amp_vs_dram_iops5M.png)
+
+**Migration**
+![](results/sr_sift_default_fast_20251215_135028/figures/migration_vs_dram_iops1M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/migration_vs_dram_iops5M.png)
+
+**p95 vs DRAM**
+![](results/sr_sift_default_fast_20251215_135028/figures/p95_vs_dram_iops1M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/p95_vs_dram_iops5M.png)
+
+**p95 vs IOPS**
+![](results/sr_sift_default_fast_20251215_135028/figures/p95_vs_iops_dram5.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/p95_vs_iops_dram20.png)
+
+**Recall–latency frontier**
+![](results/sr_sift_default_fast_20251215_135028/figures/recall_latency_frontier_dram5_iops1M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/recall_latency_frontier_dram5_iops5M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/recall_latency_frontier_dram20_iops1M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/recall_latency_frontier_dram20_iops5M.png)
+
+**SLA reachable recall**
+![](results/sr_sift_default_fast_20251215_135028/figures/sla_reachable_recall_dram5_iops1M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/sla_reachable_recall_dram5_iops5M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/sla_reachable_recall_dram20_iops1M.png)
+![](results/sr_sift_default_fast_20251215_135028/figures/sla_reachable_recall_dram20_iops5M.png)
+
+### 7.3 Hotspot workload (fast fast)
+
+Run directory: `results/sr_sift_exp_hotspot_fast_fast_20251215_135028`
+
+The core characteristic of this workload is: hotspots change quickly, and the lists that are accessed tend to be long, so SSD page reads under all_ssd are very high, and p95 latency naturally stays in the millisecond range.
+
+#### 7.3.1 Key numbers (max_iops=5M, nprobe=1)
+
+| dram_fraction | policy       | p95 (μs) | recall |   IOAmp | total_migration_bytes |
+| ------------: | ------------ | -------: | -----: | ------: | --------------------: |
+|          0.05 | all_ssd      |    ~8100 | 0.5293 | ~179.99 |                     0 |
+|          0.05 | naive_lfu    |    ~6560 | 0.5293 | ~150.10 |                ~50 MB |
+|          0.05 | window_lfu   |    ~6960 | 0.5293 | ~148.18 |               ~121 MB |
+|          0.05 | seconds_rule |    ~6680 | 0.5293 | ~119.26 |               ~671 MB |
+|          0.05 | lru          |    ~6800 | 0.5293 | ~131.46 |              ~1.04 GB |
+|          0.10 | all_ssd      |    ~8100 | 0.5293 | ~179.99 |                     0 |
+|          0.10 | naive_lfu    |    ~6210 | 0.5293 | ~130.87 |                ~80 MB |
+|          0.10 | window_lfu   |    ~6680 | 0.5293 | ~122.45 |               ~203 MB |
+|          0.10 | seconds_rule |    ~6090 | 0.5293 |  ~76.23 |               ~854 MB |
+|          0.10 | lru          |    ~6680 | 0.5293 |  ~86.80 |              ~1.41 GB |
+|          0.20 | all_ssd      |    ~8100 | 0.5293 | ~179.99 |                     0 |
+|          0.20 | naive_lfu    |    ~5720 | 0.5293 |  ~99.11 |               ~111 MB |
+|          0.20 | window_lfu   |    ~6170 | 0.5293 | ~102.39 |               ~355 MB |
+|          0.20 | seconds_rule |    ~5090 | 0.5293 |  ~31.57 |               ~745 MB |
+|          0.20 | lru          |    ~5090 | 0.5293 |  ~30.63 |              ~1.72 GB |
+
+**Observations and explanations**
+
+* all_ssd has IOAmp ~180, meaning that a query reads a very large number of SSD pages, so p95 ~8 ms.
+* As dram fraction increases, IOAmp drops across all policies, and p95 drops accordingly: this is the direct outcome of “more lists residing in DRAM → fewer SSD pages read”.
+* Under dram=0.2, `seconds_rule/lru` can push IOAmp down to ~31, with p95 ~5.09 ms: this shows they are very good at catching the true hotspots when “hotspots drift quickly”, thus moving hotspot lists into DRAM as much as possible.
+* But the cost is very clear: `total_migration_bytes` reaches the GB level. This means the policy’s benefits come from “aggressive movement”. From an engineering perspective, one must consider whether this movement will squeeze bandwidth, increase write amplification, or affect stability.
+* `naive_lfu/window_lfu` have significantly smaller migration volumes (tens to hundreds of MB) , but their IOAmp is clearly higher than seconds_rule/lru: this indicates that in fast-changing-hotspot workloads, pure frequency statistics suffer from “slow reaction/lag”, and when hotspots just shift, they have not yet moved the new hotspots into DRAM in time.
+
+#### 7.3.2 Figures
+
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/io_amp_vs_dram_iops5M.png)
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/migration_vs_dram_iops5M.png)
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/p95_vs_dram_iops5M.png)
+
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/p95_vs_iops_dram5.png)
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/p95_vs_iops_dram10.png)
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/p95_vs_iops_dram20.png)
+
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/recall_latency_frontier_dram5_iops5M.png)
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/recall_latency_frontier_dram10_iops5M.png)
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/recall_latency_frontier_dram20_iops5M.png)
+
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/sla_reachable_recall_dram5_iops5M.png)
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/sla_reachable_recall_dram10_iops5M.png)
+![](results/sr_sift_exp_hotspot_fast_fast_20251215_135028/figures/sla_reachable_recall_dram20_iops5M.png)
+
+
+### 7.4 Hotspot workload (slow fast)
+
+Run directory: `results/sr_sift_exp_hotspot_slow_fast_20251215_135028`
+
+This workload still has hotspots and long lists, but hotspots change more slowly. Intuitively, this makes “frequency-based policies” more likely to stably capture hotspots, thus achieving decent IOAmp reductions with lower migration overhead.
+
+#### 7.4.1 Key numbers (max_iops=5M, nprobe=1)
+
+| dram_fraction | policy       | p95 (μs) | recall |   IOAmp | total_migration_bytes |
+| ------------: | ------------ | -------: | -----: | ------: | --------------------: |
+|          0.05 | all_ssd      |    ~7110 | 0.5293 | ~178.60 |                     0 |
+|          0.05 | window_lfu   |    ~6680 | 0.5293 | ~140.11 |                ~84 MB |
+|          0.05 | naive_lfu    |    ~6840 | 0.5293 | ~147.64 |                ~54 MB |
+|          0.05 | seconds_rule |    ~6680 | 0.5293 | ~141.50 |               ~651 MB |
+|          0.05 | lru          |    ~7110 | 0.5293 | ~159.71 |              ~1.24 GB |
+|          0.10 | window_lfu   |    ~5870 | 0.5293 | ~114.20 |               ~121 MB |
+|          0.10 | naive_lfu    |    ~6290 | 0.5293 | ~125.51 |              ~35.5 MB |
+|          0.10 | seconds_rule |    ~6280 | 0.5293 |  ~69.73 |               ~299 MB |
+|          0.10 | lru          |    ~6840 | 0.5293 | ~141.72 |              ~2.23 GB |
+|          0.20 | window_lfu   |    ~5610 | 0.5293 |  ~80.13 |               ~130 MB |
+|          0.20 | naive_lfu    |    ~6030 | 0.5293 |  ~96.84 |                ~58 MB |
+|          0.20 | seconds_rule |    ~5570 | 0.5293 |  ~80.11 |               ~944 MB |
+|          0.20 | lru          |    ~6280 | 0.5293 | ~109.89 |              ~3.45 GB |
+
+**Observations and explanations**
+
+* Under dram=0.2, `window_lfu` has IOAmp ~80.13, almost the same as `seconds_rule` at ~80.11, but its migration volume is only ~130 MB, compared to seconds_rule’s ~944 MB, showing that when hotspots change more slowly, “sliding-window frequency” is enough to stably lock onto hotspots.
+* `lru` is extreme in migration (GB level) but IOAmp is not better than window_lfu, exhibiting the characteristic of “excessive movement with limited benefit”.
+* Overall, slow fast is more suitable for choosing “frequency/sliding-window frequency” policies: they obtain close or even better IOAmp and p95 with much lower migration cost.
+
+#### 7.4.2 Figures
+
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/io_amp_vs_dram_iops5M.png)
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/migration_vs_dram_iops5M.png)
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/p95_vs_dram_iops5M.png)
+
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/p95_vs_iops_dram5.png)
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/p95_vs_iops_dram10.png)
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/p95_vs_iops_dram20.png)
+
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/recall_latency_frontier_dram5_iops5M.png)
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/recall_latency_frontier_dram10_iops5M.png)
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/recall_latency_frontier_dram20_iops5M.png)
+
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/sla_reachable_recall_dram5_iops5M.png)
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/sla_reachable_recall_dram10_iops5M.png)
+![](results/sr_sift_exp_hotspot_slow_fast_20251215_135028/figures/sla_reachable_recall_dram20_iops5M.png)
+
+
+### 7.5 Uniform workload
+
+Run directory: `results/sr_sift_exp_uniform_fast_20251215_135028`
+
+The core of the uniform workload is: accesses are more even and hotspots are weak. Thus “hotspot-chasing” policies naturally have a harder time gaining advantage, because true hotspots are not concentrated.
+
+#### 7.5.1 Key numbers (max_iops=5M, nprobe=1)
+
+| dram_fraction | policy       | p95 (μs) | recall |  IOAmp | total_migration_bytes |
+| ------------: | ------------ | -------: | -----: | -----: | --------------------: |
+|          0.05 | all_ssd      |    ~3300 | 0.5293 | ~86.41 |                     0 |
+|          0.05 | naive_lfu    |    ~2910 | 0.5293 | ~74.18 |              ~61.8 MB |
+|          0.05 | window_lfu   |    ~2910 | 0.5293 | ~74.09 |              ~20.3 MB |
+|          0.05 | seconds_rule |    ~3000 | 0.5293 | ~77.39 |               ~224 MB |
+|          0.05 | lru          |    ~3280 | 0.5293 | ~81.23 |               ~266 MB |
+|          0.10 | naive_lfu    |    ~2850 | 0.5293 | ~66.35 |              ~81.8 MB |
+|          0.10 | window_lfu   |    ~2860 | 0.5293 | ~66.19 |              ~26.4 MB |
+|          0.10 | seconds_rule |    ~2930 | 0.5293 | ~69.73 |               ~299 MB |
+|          0.10 | lru          |    ~3250 | 0.5293 | ~77.26 |               ~485 MB |
+|          0.20 | naive_lfu    |    ~2790 | 0.5293 | ~52.70 |               ~107 MB |
+|          0.20 | window_lfu   |    ~2760 | 0.5293 | ~52.32 |              ~38.9 MB |
+|          0.20 | seconds_rule |    ~2790 | 0.5293 | ~55.69 |               ~327 MB |
+|          0.20 | lru          |    ~3030 | 0.5293 | ~68.75 |               ~838 MB |
+
+**Observations and explanations**
+
+* `window_lfu` consistently shows the stable pattern of “low migration + low IOAmp + low p95” under all three DRAM configurations: in the uniform scenario, there is no intense hotspot drift, and sliding-window frequency is sufficient.
+* `seconds_rule/lru` have significantly larger migration volume but no correspondingly lower IOAmp: when hotspots are weak, “chasing hotspots” easily becomes “chasing noise”, and the net benefit of movement is limited.
+* As DRAM grows, IOAmp clearly decreases (from 86 → about 52) , and p95 drops from ~3.30 ms to ~2.76 ms: this shows that increasing DRAM steadily yields benefits, but is still limited by the “portion that inevitably falls on SSD due to uniform access”.
+
+#### 7.5.2 Figures
+
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/io_amp_vs_dram_iops5M.png)
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/migration_vs_dram_iops5M.png)
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/p95_vs_dram_iops5M.png)
+
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/p95_vs_iops_dram5.png)
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/p95_vs_iops_dram10.png)
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/p95_vs_iops_dram20.png)
+
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/recall_latency_frontier_dram5_iops5M.png)
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/recall_latency_frontier_dram10_iops5M.png)
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/recall_latency_frontier_dram20_iops5M.png)
+
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/sla_reachable_recall_dram5_iops5M.png)
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/sla_reachable_recall_dram10_iops5M.png)
+![](results/sr_sift_exp_uniform_fast_20251215_135028/figures/sla_reachable_recall_dram20_iops5M.png)
+
+### 7.6 Zipf workload (s = 1.2)
+
+Run directory: `results/sr_sift_exp_zipf_s1.2_fast_20251215_135028`
+
+The core of the Zipf workload is a strong long tail: a small number of clusters are very hot, and most clusters are very cold. This usually makes “frequency-based policies” easily obtain high hit benefits with small cost.
+
+#### 7.6.1 Key numbers (max_iops=5M, nprobe=1)
+
+| dram_fraction | policy       | p95 (μs) | recall |   IOAmp | total_migration_bytes |
+| ------------: | ------------ | -------: | -----: | ------: | --------------------: |
+|          0.05 | all_ssd      |    ~7650 | 0.5293 | ~177.20 |                     0 |
+|          0.05 | naive_lfu    |    ~6730 | 0.5293 | ~112.74 |               ~9.1 MB |
+|          0.05 | window_lfu   |    ~6730 | 0.5293 | ~112.74 |               ~9.1 MB |
+|          0.05 | seconds_rule |    ~6830 | 0.5293 | ~113.77 |              ~73.9 MB |
+|          0.05 | lru          |    ~7650 | 0.5293 | ~147.86 |               ~476 MB |
+|          0.10 | naive_lfu    |    ~6310 | 0.5293 |  ~94.49 |              ~19.6 MB |
+|          0.10 | window_lfu   |    ~6070 | 0.5293 |  ~93.52 |              ~21.5 MB |
+|          0.10 | seconds_rule |    ~6340 | 0.5293 |  ~94.07 |               ~181 MB |
+|          0.10 | lru          |    ~6990 | 0.5293 | ~122.87 |               ~807 MB |
+|          0.20 | naive_lfu    |    ~5590 | 0.5293 |  ~67.47 |              ~71.9 MB |
+|          0.20 | window_lfu   |    ~5590 | 0.5293 |  ~67.25 |              ~92.6 MB |
+|          0.20 | seconds_rule |    ~5670 | 0.5293 |  ~68.52 |               ~321 MB |
+|          0.20 | lru          |    ~6560 | 0.5293 |  ~93.72 |              ~1.37 GB |
+
+**Observations and explanations**
+
+* Under dram=0.05, `naive_lfu/window_lfu` can already push IOAmp from ~177 down to ~113, while migration is only ~9 MB: Zipf’s hotspots are extremely stable and concentrated, so frequency statistics easily “hit the correct objects long-term” and almost no frequent movement is needed.
+* `seconds_rule` has IOAmp close to window_lfu but larger migration: this shows that in the Zipf scenario, “chasing hotspots in time” does not bring extra hit advantage, but instead introduces more movement.
+* `lru` has large migration but does not lead in IOAmp: in a strong long-tail with stable hotspots, LRU is more likely to continually swap in short-term noisy accesses, causing unnecessary movement.
+
+#### 7.6.2 Figures
+
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/io_amp_vs_dram_iops5M.png)
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/migration_vs_dram_iops5M.png)
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/p95_vs_dram_iops5M.png)
+
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/p95_vs_iops_dram5.png)
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/p95_vs_iops_dram10.png)
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/p95_vs_iops_dram20.png)
+
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/recall_latency_frontier_dram5_iops5M.png)
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/recall_latency_frontier_dram10_iops5M.png)
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/recall_latency_frontier_dram20_iops5M.png)
+
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/sla_reachable_recall_dram5_iops5M.png)
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/sla_reachable_recall_dram10_iops5M.png)
+![](results/sr_sift_exp_zipf_s1.2_fast_20251215_135028/figures/sla_reachable_recall_dram20_iops5M.png)
+
+### 7.7 Summary of findings across workloads
+
+Looking at the results of each workload together, we can obtain three stable conclusions (without any “historical comparison”, only summarizing this set of results itself) : 
+
+* The path of moving nprobe from 1→32 is clear: higher recall requires scanning more lists, so latency must increase**. The frontier plots clearly show this.
+* SSD tail latency is mainly driven by IOAmp/page count: policies (or larger DRAM fractions) that significantly reduce IOAmp will significantly reduce p95; otherwise p95 stays at the ms level.
+* Policy choice depends on hotspot stability: 
+
+  * Fast-changing hotspots: `seconds_rule/lru` can push IOAmp lower, but migration volume reaches the GB level; 
+  * Slow-changing or stable long-tail hotspots: `window_lfu/naive_lfu` often achieve comparable or even better IOAmp and p95 with smaller migration; 
+  * Nearly uniform access: hotspot-chasing policies tend to “chase noise”, with large migration but limited hit benefits.
+
+
+
+
+## 8. Discussion
+
+### 8.1 Why SSD dominates p95
+
+In the current page-level I/O model, a single SSD page access costs about 20.2 microseconds (when max IOPS = 5M) . If we ignore CPU computation, we can approximate p95 as
 
 $$
-\text{Cost}*{\text{disk}} \approx \frac{C*{\text{io}}}{\Delta T}
+\text{p95} \approx t_{\text{page}} \times \text{pages} + \text{CPU}_{\text{overhead}}
 $$
 
-当两种方案的成本相等时，有：
+where `pages` is proportional to `io_amp` (up to a constant scaling) , and `CPU_overhead` is on the order of tens of microseconds under all DRAM. From the SLA we can back out the number of allowable pages: 
 
-$$
-C_{\text{mem}} = \frac{C_{\text{io}}}{\Delta T^*}
-$$
-
-解出临界重用间隔 $\Delta T^*$：
-
-$$
-\Delta T^* = \frac{C_{\text{io}}}{C_{\text{mem}}}
-$$
-
-含义是：
-
-* 如果实际重用间隔 $\Delta T < \Delta T^*$，说明访问很频繁，缓存这页更划算；
-* 如果 $\Delta T > \Delta T^*$，说明访问很稀疏，没必要用内存长期“占位”。
-
-在现代硬件（包括 SSD）和 AI 工作负载的背景下，上述比值中的 $C_{\text{io}}$ 和 $C_{\text{mem}}$ 都发生了变化，对应的“临界间隔” $\Delta T^*$ 也会变化。
-一些研究发现，在某些场景下，这个关键时间不再是“分钟级”，而是降到了 秒级，也就是“在若干秒内是否被重用”就足以决定是否值得缓存。
-
-本项目提出的 Seconds-Rule，就是把这种“经济模型 + 重用间隔”的思想迁移到 ANN 的倒排列表上，形成一个在线分层策略。
-
-可以定义一个“秒级热度”的简单示例。对于某个倒排列表 $\ell$，在时间 $t$ 时刻，统计它在最近 $S$ 秒内被访问的次数：
-
-$$
-h_\ell(t)
-= \#\{\tau \mid t - S \le \tau \le t,\ \text{在时间 } \tau \text{ 访问了列表 } \ell\}
-$$
-
-给定一个阈值 $H$，可以采用类似的决策规则：
-
-* 如果
+* If SLA = 500 µs, the allowed number of pages is approximately
   $$
-  h_\ell(t) \ge H
+  \frac{500}{20.2}\approx 24.75
   $$
-  说明列表 $\ell$ 在最近 $S$ 秒内非常“热”，更倾向于将它放在 DRAM 中；
-
-* 如果
+* If SLA = 200 µs, the allowed number of pages is approximately
   $$
-  h_\ell(t) < H
+  \frac{200}{20.2}\approx 9.9
   $$
-  说明列表 $\ell$ 在这一时间尺度上的活跃度不足，可以优先让它留在 SSD 或被驱逐。
 
-真实的 Seconds-Rule 策略比这个示意公式更复杂：
-需要考虑 DRAM 总容量约束、每个列表的大小、迁移成本、访问延迟等多种因素，但核心出发点可以概括为在秒级时间尺度上定义和检测“热集”，优先让这些热集对应的倒排列表常驻 DRAM，从而在混合 DRAM+SSD 的结构中取得更好的延迟与召回权衡。
-本项目就是在 IVF 索引之上实现并评估这样的秒级分层策略，并与传统策略（如 LRU、LFU、Window-LFU 等）进行系统对比。
+However, in the experiments, under the default workload, all SSD, and `nprobe=1`, the average already requires about 43.9 pages; under hotspot / Zipf and other workloads, all SSD with `nprobe=1` has `io_amp ≈ 180`, corresponding to more than 220 pages per query. Even when the DRAM fraction reaches 0.2 and we use relatively good policies (such as window LFU) , in many scenarios the average page count is still higher than 25 pages.
 
+This leads to two direct consequences. First, as long as there are SSD list scans in the tail, p95 will basically fall into the millisecond range. Second, under `SLA=200µs / 500µs`, all SSD-involving configurations have no feasible solution in `agg/sla_reachable_recall`, with `best_nprobe = -1`, and only all DRAM can satisfy the SLA.
 
-## 3. 研究问题与范围
+This means that “giving a bit more DRAM + using a good caching policy” is not enough to pull the system into the sub-ms range, because the granularity of data on SSD is too large: once there is a miss, even if only one or two lists miss, you will still scan dozens or even hundreds of pages.
 
-### 3.1 研究问题
+To really push p95 down, the key is to reduce how much SSD data a single query will touch, rather than just increasing DRAM. Several directions can be considered: 
 
-本报告的核心研究问题是：在已经固定使用 IVF 这一类 ANN 索引结构的前提下，是否可以通过一个在线的“秒级热度（Seconds-Rule）”分层策略，按时间上的“热度”选择哪些倒排列表放在 DRAM 中，从而在召回率、尾延迟和 SSD I/O 放大量之间，取得比经典缓存策略（如 LRU、LFU、Window-LFU）更好的综合权衡。
+* Store lighter-weight representations on SSD. For example, store only PQ codes or low-dimensional projections on SSD, use these low-cost codes to do a coarse pre-filter, and then pull back only a very small number of candidates into DRAM for reranking, turning “one miss reads 0.4–0.9 MB” into “reading tens of KB”.
+* Reduce the number of lists that need to be accessed. Use stronger routing or graph structures (similar to DiskANN, SPANN) to reduce the number of lists that must be probed; or transform “a few large lists” into “many small lists”, so that even if `nprobe` remains unchanged, the total bytes become smaller.
+* Increase flexibility in caching granularity. In the current experiments the caching unit is an entire list; if we instead cache the head of a list, hot subsegments, or recently accessed blocks, limited DRAM could cover more of the tail, avoiding reading a full list from SSD on every miss.
 
-### 3.2 研究范围
+In summary, under the current configuration, SSD I/O is the dominant term of tail latency: as long as SSD appears in the tail path, p95 naturally rises by two orders of magnitude; to achieve sub-ms SLA, either almost all queries must stay in DRAM, or accesses on SSD must be made sufficiently “few and light”.
 
-本报告的工作范围集中在“给定 ANN 索引结构后，如何设计和评估 DRAM+SSD 分层策略”这一层面，而不是把索引算法创新、系统工程和产品化全部混在一起。具体来说，主要做了三类事情。
+### 8.2 Tradeoff between adaptability and migration
 
-* 分层策略的设计与对比：报告中实现并评估了一组可直接运行的分层策略。
-  其中，Seconds-Rule 是我提出并重点分析的在线策略，它在秒级时间窗口内跟踪每个倒排列表的访问情况，根据“最近若干秒内的活跃度”来判断一个列表是否应当留在 DRAM 中。策略在查询流到来时持续更新热度估计，并在 DRAM 容量受限的前提下做出晋升或驱逐决策。
-  为了有清晰的对照，本报告同时实现了多种经典策略作为基线，包括 LRU、LFU 和 Window-LFU。这些策略代表了现实系统中非常常见的做法，能够用来判断 Seconds-Rule 是否真的带来了改进。
-  此外，还使用 All-DRAM 和 All-SSD 作为极端“上界”和“下界”，用于给所有实验结果提供一个性能参考区间。
+The fast–fast hotspot experiments nicely illustrate the tension between “adaptability” and “migration cost” in caching policies.
 
-* 指标体系的构建与使用：报告没有只盯着某一个指标，而是构建了一组互补的度量，用来量化“好不好”这个问题。
-  首先是召回率，用来衡量 ANN 结果相对于精确 kNN 的质量，判断分层策略是否对检索精度造成显著损伤。
-  其次是 p95 延迟，用来反映尾部请求的响应时间，而不是只看平均值。这一指标对“有多少查询需要访问 SSD、需要访问几次 SSD”等因素非常敏感。
-  再次是 SSD I/O 放大量，用来描述“一次逻辑查询在底层触发了多少额外的读写”，直接刻画策略对存储层的压力。
-  最后是 DRAM 与 SSD 之间的数据迁移字节数，用来衡量策略在维持热集时付出的后台代价。通过这四类指标，可以从质量、速度、成本三个角度综合评价不同策略。
+#### 8.2.1 Strong adaptability: lower IOAmp, huge migration
 
-* 可复现的实验流水线与工件产出：报告围绕 Seconds-Rule 及其基线策略，搭建了一条完整的实验流水线，用来从配置到结果自动运行出一套可检查、可复现的工件。
-  流水线以统一的配置文件为入口，明确数据集、索引结构、候选策略、DRAM 容量扫描范围和查询轨迹。随后，对每一种“策略 × 容量”的组合，在模拟环境中重放查询流，记录访问路径、延迟、I/O 和迁移等信息。
-  运行结束后，流水线会自动生成原始和聚合后的 CSV 文件、对应的图像，以及完整日志。任何获得同一份 Report Bundle 的人，只要在相似环境中重新执行 one-click 入口脚本，就能再现这套结果。
+Under hotspot fast–fast with DRAM at 5%: 
 
-### 3.3 不在研究范围内的内容
+* seconds rule / LRU can push `io_amp` down from ~180 for all SSD to around ~120; 
+* with DRAM at 20%, `io_amp` can even drop to ~30, and p95 is reduced from 8+ ms to ~5 ms; 
+* at the same time, migrated bytes soar to the hundreds-of-MB to GB range.
 
-为了避免读者误解本工作的目标，本报告也明确说明哪些事情“不在当前研究范围内”。这些内容不是能力不足，而是为了聚焦问题而主动划定的边界。
+When hotspots move very quickly, such “high-adaptivity” policies do have value: those few large lists that just turned hot can be quickly pulled into DRAM, significantly reducing SSD scan counts and page counts.
 
-* 不设计全新的 ANN 索引结构：报告不会尝试发明一种全新的 ANN 索引，比如新的图结构、新的层级索引或对 HNSW 的根本性改造。
-  整个研究从一开始就假定：底层索引结构已经选定为类似 Faiss IVF 的标准形式。我要回答的问题是：在这个既定结构之上，如何通过分层策略更好地使用有限的 DRAM，而不是改变索引本身。
+Mechanistically, LRU / seconds rule are essentially “time-locality-first” policies: lists that have just been accessed frequently are quickly pulled into DRAM, and once hotspots shift, old hotspot lists are quickly kicked out. This matches the fast–fast hotspot workload very well, so the `io_amp` curve drops fastest.
 
-* 不构建完整的生产级向量数据库：报告不会把 Seconds-Rule 真实接入某个现成的向量数据库产品，也不会实现多租户、权限控制、分布式部署、服务治理等工程层面的功能。
-  实验环境是一个模拟器加延迟模型的组合，目的是在一个可控的环境中观察分层策略对延迟、I/O 和迁移的影响，而不是完整覆盖线上系统的所有细节。将 Seconds-Rule 融入具体产品，属于后续工程落地的工作，不在这篇报告的直接范围内。
+The problem lies in migration cost: every time the hotspot shifts, a batch of very large lists must be moved, repeatedly migrating them between SSD and DRAM; from a total-bytes perspective, this may even be more expensive than simply scanning from SSD every time. In other words, I/O in the query path is reduced, but “migration I/O” is amplified.
 
-* 不精细建模真实 SSD 队列和设备内部行为：报告不会尝试构建一个与某款具体 SSD 一一对应的复杂模型，不会显式模拟操作系统 I/O 调度、设备内部并行度、写放大和 GC 等细节。
-  在实验中使用的是抽象化的延迟模型和访问统计：通过记录访问次数和数据量，近似估算不同策略对 SSD 的负载，然后比较策略之间的相对差异。这样做的目的是保持模型足够透明，让“策略好坏”的结论主要来自于策略本身，而不是埋在复杂硬件细节中的偶然效应。
+#### 8.2.2 Strong stability: low migration, slightly higher IOAmp
 
+Compared with seconds rule / LRU, naive LFU and window LFU are clearly “more stable”: 
 
-## 4. 系统 / 模拟器设计
+* Under fast–fast, their `io_amp` and p95 are slightly higher than seconds rule / LRU (for example, p95 at 6.5–7 ms vs 5–6 ms) , but migration is controlled in the tens-to-hundreds-of-MB range, an order of magnitude lower.
+* Under hotspot slow–fast and Zipf, window LFU / naive LFU can basically achieve tail latency close to seconds rule with much smaller migration overhead. In the slow–fast scenario, hotspots move more slowly, giving frequency statistics sufficient time to converge; in the Zipf scenario, hot clusters are stably hot for a long time, and long-term frequencies are essentially the true hotness.
 
-### 4.1 分层 IVF 存储模型
+Intuitively, strong adaptability means the residency set changes frequently, tracking hotspots in a timely manner, but with a lot of migration; strong stability means the residency set changes slowly, with low migration, but reacts relatively slowly when hotspots suddenly switch. window LFU sits between the two: compared with naive LFU it has “forgetting” capability and will not remember very old hotspots forever; compared with LRU / seconds rule it is much smoother and will not completely reshuffle the cache due to very short-term fluctuations.
 
-评测从一个抽象的两级存储模型开始：
-IVF 索引由许多倒排列表（inverted lists）组成，每一个倒排列表在任意时刻只属于两个层级之一：
+#### 8.2.3 Incorporating migration cost into the objective
 
-* DRAM 层：访问延迟极低，读取一次倒排列表的代价很小，但总容量受到严格限制。
-* SSD 层：访问延迟显著更高，每次读取倒排列表都需要触发一次 SSD I/O，带来明显的延迟成本，但容量近似可视为“足够大”。
+If we want to use these policies in real systems in the future, looking only at `io_amp` / p95 is insufficient. Migration bytes themselves bring pressure on SSD bandwidth and lifetime, contention for DRAM bandwidth, and extra CPU overhead for participating in migration.
 
-在 IVF 结构下，一次查询不会访问全部倒排列表，而是只探测若干个与查询最相关的列表。可以把“一次查询”抽象成“探测一组列表”的过程：
-
-* 对于被探测到、且当前位于 DRAM 的列表，只需要付出 DRAM 访问的成本。
-* 对于被探测到、且当前位于 SSD 的列表，必须付出 SSD I/O 成本，这对尾延迟影响很大。
-
-因此，从系统角度看，分层策略的职责可以概括为一句话：
-
-* 在给定的 DRAM 容量约束下，选择一部分倒排列表常驻 DRAM，并随着时间推移根据访问热度变化适时迁移列表，使“真正热点”尽量留在 DRAM 中，从而降低整体和尾部的查询延迟，同时控制 I/O 和迁移代价。
-
-模拟器所做的，就是在这种两级存储抽象下，重放真实或合成的查询序列，统计在不同策略、不同 DRAM 容量下的延迟、I/O 和迁移情况。
-
-
-
-### 4.2 策略接口
-
-无论是 Seconds-Rule 还是 LRU/LFU，一旦放进这个模拟框架里，都可以被统一视为“策略模块”。
-一个分层策略在系统中的接口大致可以拆成三个部分：输入信号、内部状态、输出决策。
-
-* 输入信号（策略可以观察到的信息）
-
-  策略不会直接看到“未来的查询”，只能根据已经发生的事件做出判断。典型输入包括：
-
-  * 倒排列表被访问的事件：每当某个列表被查询探测到，策略收到一条“列表 $\ell$ 在时间 $t$ 被访问”的记录。
-  * 时间信息：每个访问事件都有时间戳，策略可以用它来估计重用时间间隔、空闲时长等特征。
-
-  在实现层面，可以把输入理解成一条不断到来的事件流：“某时刻访问了某个列表”。
-
-* 内部状态（策略在运行过程中维护的量）
-
-  为了利用历史信息，策略需要为每个倒排列表维护一些状态量，例如：
-
-  * 访问次数：用于实现 LFU 或 Window-LFU 类策略。
-  * 最近一次访问时间：用于实现 LRU 类策略，或者估算空闲时长。
-  * 平均重用间隔的估计值：用于判断长期热度。
-  * 其他统计量：例如指数加权移动平均（EWMA）的间隔、秒级窗口内的计数等。
-
-  这些状态不会直接暴露给外部系统，但会影响策略做出的迁移与驻留决策。
-
-* 决策输出（策略真正“干了什么”）
-
-  策略需要定期或在特定触发条件下做两类决策：
-
-  * 给定当前 DRAM 容量约束，选择哪些倒排列表应当放在 DRAM 中，也就是维护一个“DRAM 集合”的候选排序或打分。
-  * 当 DRAM 空间不足或列表热度发生明显变化时，生成迁移计划：驱逐一部分不再足够热的列表，把一些足够热的列表从 SSD 提升到 DRAM。
-
-  在模拟器中，这些决策会转化为具体的迁移操作和层级变更，从而改变后续查询的访问路径和延迟。
-
-通过这种统一接口，可以在同一套框架下插入不同分层策略，对它们进行公平对比：输入信号相同，容量约束相同，只是内部状态定义和决策逻辑不同。
-
-
-
-### 4.3 Seconds-Rule 策略
-
-Seconds-Rule 策略的核心思想，是同时利用“长期热度”和“短期活跃度”这两类信息，为每个倒排列表构造一个简单、可解释的综合评分，然后按评分挑选哪些列表应该放在 DRAM 中。
-
-在这个策略下，每个列表 $\ell$ 都维护两个关键量：
-
-* 一个是平均重用间隔（平均访问间隔），记为 $\text{avg\_interval}_\ell$，用来反映“从长时间尺度看，这个列表平均多久被访问一次”。这个量越小，说明长期访问频率越高，更偏向于“长期热门”（类似 LFU 的视角）。
-* 另一个是空闲时间，记为 $\text{idle}_\ell$，表示“从最近一次访问到当前时刻已经过去了多长时间”。这个量越小，说明近期刚被访问过，更偏向于“短期刚活跃”（类似 LRU 的视角）。
-
-Seconds-Rule 把这两个量线性组合成一个“有效间隔”：
+A more reasonable approach is to explicitly incorporate migration cost into the optimization objective. For example, for each list we could compute something like
 
 $$
-\mathrm{effective\_interval}_{\ell}=\mathrm{avg\_interval}_{\ell}\,\lambda\,\mathrm{idle}_{\ell}
+\text{benefit density} = \frac{\text{expected reduction in SSD bytes}}{\text{migration bytes}}
 $$
 
+and only bring into DRAM those lists with the highest “benefit density”, rather than simply sorting by access count. This can limit migration oscillations caused by very large lists, and avoid repeatedly moving in and out a batch of huge lists with only moderate access frequency in the name of chasing hotspots. If we include I/O caused by migration into total I/O and directly compare policies using “query I/O + migration I/O”, we will get closer to the true cost.
 
-其中，$\lambda$ 是一个可调的权重，用来平衡长期频率和短期新鲜度在决策中的相对重要性：
+### 8.3 nprobe choice is still fundamental
 
-* 当 $\lambda$ 取值非常小时，$\text{effective\_interval}*\ell$ 主要由 $\text{avg\_interval}*\ell$ 决定，策略更接近“按长期访问频率排序”，类似于 LFU。
-* 当 $\lambda$ 取值较大时，$\text{idle}_\ell$ 的影响变得更显著，策略更接近“按最近访问时间排序”，类似于 LRU。
+Whether or not SSD is involved, `nprobe` is still the main knob controlling the recall–latency tradeoff. The all DRAM results in Section 7 show a stable pattern: 
 
-在这一定义下，可以给出一个简单的排序规则：
+* `nprobe = 1`: recall ~ 0.5–0.6, extremely low latency; 
+* `nprobe = 2`: recall ~ 0.7–0.8; 
+* `nprobe = 4`: recall ~ 0.85–0.9, already close to a clear knee point; 
+* `nprobe = 8`: recall ~ 0.95 or so; 
+* `nprobe = 16`: recall ~ 0.998; 
+* `nprobe = 32`: recall approaches 1, with strongly diminishing returns.
 
-* 对所有列表按照 $\text{effective\_interval}_\ell$ 从小到大排序；
-* 在 DRAM 容量允许的前提下，优先保留 $\text{effective\_interval}_\ell$ 最小的那一批列表在 DRAM 中，其余列表驻留在 SSD 上。
+Under all DRAM, latency mainly comes from operator cost, and this “multiplication” is still relatively mild. Once SSD is added, the amplification effect of `nprobe` basically becomes “page count grows by a multiplicative factor”: under the default configuration, all SSD with `nprobe=1` already uses dozens of pages; doubling `nprobe` from 1 pushes `io_amp` and page count to grow roughly by a factor, naturally multiplying p95.
 
-直观理解是：长期来看平均重用间隔越短、最近一次访问离现在越近的列表，会被视为“真正的热点”，更有资格占据有限的 DRAM 空间。
+Therefore, in systems involving SSD, a more reasonable idea is not “first crank `nprobe` up to reach 0.999 recall and then rely on caching to bail us out”, but to jointly tune around a “page budget”.
 
-需要强调的一点是，Seconds-Rule 不是一个黑箱机器学习模型，而是一个结构非常简单的、可解释的策略：
+We can first back out the allowable I/O budget from the SLA. For example, with SLA = 5 ms and page cost ≈ 20 µs, the allowed total page count is about 250 pages; if we reserve 0.5–1 ms for CPU, the remaining I/O budget roughly corresponds to 200 pages. Under a given policy and DRAM fraction, we can estimate the relationship `pages(nprobe, policy, dram)` via offline experiments or online statistics; for example, under the default + 10% DRAM + window LFU scenario, `nprobe=4` might correspond to about 60 pages, `nprobe=8` about 110 pages, and `nprobe=16` about 200 pages.
 
-* 所有状态变量和参数都有明确含义，方便调试和分析。
-* 权重 $\lambda$ 可以根据工作负载特征进行调节，实质上是在“更看重长期频率”与“更看重近期活跃度”之间滑动。
-* 如果业务侧有额外先验（例如某类列表必须常驻、某些列表可以低优先级处理），可以在这个打分框架中自然加入附加项，而不破坏整体结构。
+Based on such a relationship, we can choose the largest `nprobe` within the budget, i.e., choose the configuration that yields the highest recall while satisfying `pages(nprobe, policy, dram) ≤ pages_budget`. For an online system, we can also dynamically adjust `nprobe` based on current load and observed p95: when IOPS approaches its bottleneck or p95 exceeds the budget, automatically tighten `nprobe` from 8 down to 4, sacrificing some recall in exchange for more stable tail latency.
 
-在模拟器中，Seconds-Rule 就通过不断更新 $\text{avg\_interval}*\ell$ 和 $\text{idle}*\ell$，并定期重算 $\text{effective\_interval}_\ell$，来驱动 DRAM/SSD 之间的晋升与驱逐。
+In other words, the choice of `nprobe` should not be discussed separately from caching policy and DRAM fraction, but instead jointly optimized within a unified “page budget / SLA budget” framework.
 
-### 4.4 基线策略
+### 8.4 Practical configuration hints
 
-为了判断 Seconds-Rule 是否真的带来了收益，本报告在同一套模拟框架下实现并对比了多种经典基线策略。这些策略代表了实践中常见的分层思路，也覆盖了“极端上界与下界”的参考点。
+Combining the results from Section 7, we can give several engineering-oriented configuration suggestions (not as rigorous proofs, but as tuning experience summaries) .
 
-* All-DRAM 策略：把所有倒排列表都放在 DRAM 中，不使用 SSD。
-  这并不是一个现实可行的部署方案，因为需要巨大的 DRAM 容量，但在模拟中它提供了理论上的延迟和 I/O 上界：在相同查询负载下，p95 延迟和 SSD I/O 基本可以视为“最理想”的情况，其它策略都不可能在这两个指标上超越它。
+Strict sub-ms SLA (200–500 µs) 
+Under the current model and data scale, only all DRAM can achieve such SLA. If SSD must be involved, we can only consider a very small amount of fine-grained SSD I/O, for example SSD storing only PQ codes or block-level reads/writes, which already belongs to architectural redesign at the system level, rather than being a simple `nprobe` / caching-policy tuning problem.
 
-* All-SSD 策略：把所有倒排列表都放在 SSD 上，不使用 DRAM。
-  这代表了“完全不做分层”的极端情况，通常会带来最高的延迟和 I/O 放大量，但 DRAM 成本最低。
-  它为所有分层策略提供了一个对照下界：任何合理的策略，在相同 DRAM 预算下性能都不应比 All-SSD 更差。
+Millisecond-level SLA (e.g., 5–20 ms) with SSD
+Under fast–fast hotspot scenarios, if higher migration overhead is acceptable, we can use seconds rule / LRU with a relatively high DRAM fraction (10–20%) , using strong adaptability to aggressively chase hotspots and push `io_amp` very low; if system-wide I/O and stability are more important, window LFU should be preferred, with slightly higher tail latency but far lower migration overhead. Under hotspot slow–fast and Zipf, window LFU / naive LFU are basically good enough, and the migration premium of seconds rule / LRU is usually not worth it; raising DRAM fraction from 5% to 10% yields significant benefits, and from 10% to 20% gives more incremental improvement. For the default / uniform scenarios, hotspots are not concentrated enough and the improvement space from DRAM is limited; it is better to rely on `nprobe` to control recall than to expect caching to “turn the tables”; a unified cache policy of window LFU is sufficient, while LRU / seconds rule often only increases migration for little gain.
 
-* LRU 策略：通过“最近一次访问时间”来排序列表，优先让最近访问过的列表留在 DRAM 中，把最久未访问的列表驱逐到 SSD。
-  这一策略完全基于“时间局部性”的假设，即“如果一个列表刚被访问，那么在不久的将来它还有较大概率再次被访问”。
+Recommended nprobe range
+If only moderate recall is needed and we want latency as low as possible, we can choose `nprobe ∈ {1, 2}`. If we want recall around 0.9, we can choose `nprobe ∈ {4, 8}` as a tradeoff. If recall must be extremely high (>0.98) , we can consider `nprobe ∈ {16, 32}`, but must accept that tail latency and I/O will grow by multiples. In scenarios involving SSD, `nprobe > 16` is more suitable for offline batch processing or weaker-SLA requests, rather than online queries with the strictest tail-latency requirements.
 
-* LFU 策略：通过“累计访问次数”来排序列表，把长期访问频率最高的那部分列表放在 DRAM 中，把访问频率最低的列表留在 SSD。
-  这一策略强调的是“长期热门”，适合访问模式相对稳定、不频繁变化的场景。
+Writing policy parameters into a “budget sheet”
+From an engineering perspective, tuning can be organized into a “budget sheet”: given SLA, page cost, traffic, and DRAM fraction, solve for appropriate `policy` (such as window LFU / seconds rule) , `nprobe`, and permitted migration rate. Online, we can add a simple adaptive control loop: once we observe p95 exceeding the budget or migration bytes surpassing the target, automatically tighten `nprobe` or switch to a more stable policy (for example, from seconds rule back to window LFU) .
 
-* Window-LFU 策略：在 LFU 的基础上引入时间窗口，只统计最近一段时间内的访问次数。超过窗口的历史访问会逐渐被遗忘，从而更好地反映当前阶段的热点，而不是过度受很久以前的访问影响。
-  相比纯 LFU，这种做法在工作负载出现阶段性变化、热点转移时，适应速度更快。
+Overall, this set of experiments demonstrates three things. First, SSD I/O is the absolute dominant factor in tail latency: either we reduce the number of misses, or we reduce the cost of each miss; otherwise, sub-ms SLA is essentially unattainable. Second, cache policy choice is essentially about picking a point in the “adaptability vs migration cost” space, and window LFU gives a fairly robust tradeoff under most realistic workloads. Third, `nprobe` is still the most fundamental and powerful tuning knob when designing ANN services; it must be considered jointly with the I/O budget and caching policy, rather than tuned in isolation.
 
-总体来看，这些基线策略构成了“只看最近访问的极端”（LRU）与“只看累计频率的极端”（LFU）之间的代表，同时也给出了“不分层”（All-SSD）和“极端理想”（All-DRAM）的上下界。
-Seconds-Rule 则可以被视为在这两类极端之间寻找平衡的一种中间方案：既继承了频率视角，又引入了秒级的近期活跃度，从而有机会在实际工作负载下获得更好的综合表现。
 
+## 9. Lessons Learned
 
-## 5. End-to-end pipeline walkthrough（端到端流水线全流程）
+Combining this round of experiments and analysis, we can compress the more “hard” takeaways into two categories: one is experience conclusions that are already relatively clear, the other is directions that would be worth prioritizing for improvement if more time were invested.
 
-本节从“数据准备”开始，一直讲到“打包输出”，只保留与本次实验核心相关的阶段。每个阶段都用完整的说明来描述：这一阶段大致输入了什么，做了哪些事情，产出了什么，又为什么和本报告的结论直接相关。本次运行的全部细节都可以在日志`results/logs/one_click_XXXX_XXXX.log`中对应找到。
+### 9.1 Experience conclusions
 
+**p95 reflects SSD risk better than average latency**
 
-### Stage 1 数据准备
+Average latency looks “okay” under many configurations, but once we look at p95, we see that as long as there is any SSD list scan mixed into the tail, latency immediately jumps to the millisecond range. In other words, average latency systematically underestimates the impact of SSD on online experience, and what truly exposes the bottleneck is p95/p99.
 
-在完成环境检查之后，流水线进入第一个和数据密切相关的阶段，也就是数据准备阶段。在这一阶段中，系统会根据配置文件中的路径，找到用于实验的向量数据集和查询集合，并尝试将它们加载为内存中的矩阵或等价的数据结构。这里会检查向量的维度是否与配置中声明的一致，检查数据条目数量是否达到预期，如果需要评估召回，还会在数据规模允许的情况下离线计算精确的 k 近邻结果，作为后续 recall 计算的基准。
+**IOAmp is the key intermediate metric for IVF+SSD**
 
-这一阶段的输出并不是新的文件，而是一个“已通过验证的数据视图”，包括已加载的向量矩阵、查询矩阵，以及可能存在的精确 ground truth。日志中会明确记录本次运行到底加载了多少条向量、每条向量的维度是多少、查询有多少条，以及 ground truth 是否成功生成。只要数据准备阶段出现缺失或损坏，后续所有关于召回的指标就会失去意义，因此这一阶段相当于为整个实验写下“本次是在什么数据基础上得出结论”的说明。
+Under the current model, p95 is almost linearly related to “how many SSD pages are read”, and `io_amp` is exactly a proxy for page count after aggregating workload, caching policy, and nprobe. As long as we keep an eye on IOAmp, it is basically equivalent to keeping an eye on latency in the SSD scenario; this is more intuitive than repeatedly inspecting p95 across different workloads, and is more convenient for policy optimization.
 
----
+**Caching at cluster granularity is simple but migration behavior can easily “run wild”**
 
-### Stage 2 建立或加载 IVF 索引
+The current implementation uses list/cluster as the minimum caching unit: the implementation is simple and statistics are also convenient, but once list sizes differ significantly, policies can exhibit very extreme behavior—for example, frequently migrating huge lists to chase hotspots, causing migration bytes to soar to the GB level, with maintenance cost far exceeding the SSD I/O of queries themselves.
 
-数据准备完成后，流水线会为向量数据构建或加载一个 IVF 索引结构。若没有现成的索引文件，系统会根据配置中的参数，例如 nlist、距离度量方式和 k 值，对向量进行聚类训练，得到一组簇中心，然后将每条数据向量分配到对应的倒排列表中，从而形成完整的 IVF 索引。如果已有预训练索引，流水线则会从磁盘加载该索引，并检查索引内部参数与当前实验配置是否一致。
+**LRU / seconds rule: high adaptability must be used together with migration constraints**
 
-这一阶段的核心输出是一个可以用于查询的 IVF 索引结构，它定义了“每个向量在倒排列表中的位置”，并决定后续 Stage 中“查询将访问哪些列表”的基础拓扑。日志会记录索引训练或加载的耗时，索引中包含的向量数量，使用的关键参数以及随机种子。如果随机种子没有被记录，不同运行之间的聚类结果可能会略有差异，从而轻微影响实验结果，因此本报告会将本次运行使用的索引参数视为当前结论的前提假设。
+LRU and seconds rule are indeed very sensitive to fast-changing hotspots (hotspot fast–fast), and can significantly push IOAmp down; but if no constraints are placed on migration, we end up in a situation where “latency goes down, but data is being shuttled between SSD↔DRAM every second”. They are better suited as “high-adaptability options” combined with explicit migration budgets, rather than as default policies.
 
----
+**window LFU is a safer default policy**
 
-### Stage 3 访问序列生成
+Across multiple workloads—default / hotspot slow–fast / Zipf / uniform—window LFU offers the most stable tradeoff between p95 and migration: latency is close to the best scheme, while migration is clearly an order of magnitude lower. In engineering practice, if only one default policy can be chosen, window LFU is more flexible than naive LFU and much more stable than LRU/seconds rule, making it a “low-tuning” safe choice.
 
-在索引就绪之后，流水线需要将查询集合转化为一条实际的访问序列，也就是在时间轴上明确“每一步访问了哪些倒排列表”。在这一阶段，系统会对每条查询执行 IVF 的簇选择步骤，根据查询向量与各个簇中心的距离，确定需要探测的倒排列表集合。然后，按照查询出现的顺序，将这些列表访问事件串联起来，就得到了一条时间序列形式的访问轨迹。
+**The current results are better suited for “mechanism analysis”, not strict statistical conclusions**
 
-根据具体配置，访问序列可以来自真实的查询日志，也可以是根据指定的概率分布生成的合成序列，甚至可以刻意设计成具有热点和冷点分区、并且在不同时间段发生热点迁移的模式。流水线会记录生成的访问序列长度、类型以及使用的随机种子。对于分层策略而言，这条访问序列就是其决策的全部外部输入，它必须仅凭这些历史访问信息判断哪些列表值得驻留在 DRAM 中。因此，访问序列既不能过于简单，也不能完全随机，本次流水线的这一阶段就是在构造一个既能反映热点结构，又能考验策略适应能力的工作负载。
+In this round of experiments, `seeds = 1` for all configurations, so confidence intervals are formally 0 and we cannot see cross-run variance. The existing results are very suitable for observing mechanisms and comparing policy trends (which is more aggressive, which has larger migration, which is more affected by workload), but if we want to write stricter statistical conclusions, we must introduce multiple seeds and provide error bars and significance analysis.
 
----
 
-### Stage 4 运行分层策略并采集指标
+### 9.2 Directions worth pursuing further
 
-访问序列生成之后，流水线进入最关键的阶段，即在同一条访问轨迹上运行不同的分层策略，并对各项指标进行详细记录。对于每一种策略和每一个 DRAM 容量配置，模拟器都会对访问序列进行完整的重放。在每一个访问事件到来时，模拟器根据当前的 DRAM 内容和策略内部状态，判断被访问的倒排列表当前是在 DRAM 还是在 SSD，如果在 DRAM，则只计入内存访问的代价，如果在 SSD，则累加一次 SSD I/O 的延迟和数据量，同时根据策略规则决定是否要把该列表迁移到 DRAM 中或驱逐其他列表。
+**Introduce PQ/compression on the SSD side to directly reduce SSD bytes**
 
-在这一阶段中，流水线会为每次查询记录必要的信息，以便后续统计，包括该查询的端到端延迟、是否命中 DRAM、触发了多少次 SSD 访问、迁移了多少字节，以及查询结果相对于精确 kNN 的召回情况。这样，每个“策略 × 容量”的组合都会生成一份原始结果表，完整反映该组合在这条访问序列上的表现。正是这些细粒度的记录，支撑了后面所有关于 p95 延迟、I/O 放大量、迁移开销和召回率的结论，也是比较 Seconds-Rule 与 LRU、LFU 等基线策略优劣的直接证据来源。
+At the moment, a single miss may scan 0.4–0.9 MB of raw list; if we can store only PQ codes / low-dimensional vectors on SSD, first use lightweight representations for coarse ranking, and then pull back only a tiny set of candidates into DRAM for reranking, we can reduce IOAmp and the cost of a single miss at the root, and get closer to the hybrid designs of real systems.
 
----
+**Introduce rate limiting or budgeting for migration**
 
-### Stage 5 聚合原始结果
+Currently, policies are completely “laissez-faire” with respect to migration, which is why seconds rule / LRU migrate up to the GB level in some scenarios. A more realistic approach is to set a migration budget for each time window (for example, at most how many bytes can be migrated per second / how many lists per minute), and automatically downgrade to more conservative policies or pause migration when the budget is exhausted, thereby keeping total I/O within an acceptable range.
 
-原始结果文件的粒度往往是“每一次查询一行”，对于分析和呈现来说过于细碎，因此流水线在这一阶段会对它们进行聚合。聚合的方式通常是按策略名称、DRAM 容量以及其他关键配置进行分组，然后在每一组内计算各种统计量，例如平均延迟、p95 延迟、平均 I/O 放大量、总迁移字节数、平均召回率，等等。聚合后的结果会被写入新的 CSV 文件，例如 `agg/ann_policy_agg.csv`，这些文件中的每一行就对应一个“策略加容量”的整体表现。
+**Explore finer-grained caching units**
 
-在此基础上，流水线还会计算一些更高层次的派生指标，例如在给定 SLA 延迟约束下，某个策略在所有容量配置中可达到的最大召回率，并将这些结果写入诸如 `agg/sla_reachable_recall.csv` 这样的文件中。通过这一阶段，原本混杂的逐查询记录被压缩成结构清晰的统计表格，使得后续绘制曲线、阅读结果以及量化偏差都变得直观而方便，这也是报告中所有表格和数字背后真正的数据来源。
+Caching entire lists wastes DRAM’s ability to serve “long-tail hotspots”. We can consider splitting lists into segments (block-level caching), or directly extracting high-frequency vectors/high-frequency segments to cache separately, so that limited DRAM focuses more on “high-value bytes”, alleviating migration oscillations caused by large lists.
 
----
+**Introduce a more realistic I/O behavior model**
 
-### Stage 6 绘制图像
+The current I/O model is fixed page latency + IOPS cap, lacking common optimizations from real systems such as sequential reads, prefetching, and merged access. Follow-up work can add mechanisms such as sequential-page discounts, read-ahead, and batch fetch in the simulation, or be calibrated against traces from real devices/kernels; this would make the conclusions more transferable in engineering practice, rather than just an analysis under an “idealized page model”.
 
-在获取聚合结果之后，流水线会自动生成一系列图像文件，把核心指标之间的关系以图形方式展现出来。这些图像通常包括 p95 延迟随 DRAM 容量变化的曲线、I/O 放大量随 DRAM 容量变化的曲线、迁移开销与容量的关系图、p95 延迟与 I/O 之间的关系图，以及展示召回率与延迟权衡的前沿曲线和在不同 SLA 下可达召回率的比较图。绘图过程读取前一阶段输出的聚合 CSV 文件，将不同策略绘制为不同的线条或点集，以便直观比较。
 
-这些图像的意义在于，它们把复杂的数值表格转化为人眼更容易抓住的模式，使读者可以一眼看出，例如 DRAM 容量增加时各策略的延迟是否整体下降，I/O 放大量是否随容量扩展而减小，Seconds-Rule 在同一容量下是否相对于 LRU 和 LFU 产生了明显优势，以及在给定 SLA 下哪一种策略能够提供更高的召回。报告中对“曲线形状”的任何描述，最终都可以在这一阶段生成的图像文件中直接进行核对。
 
----
+## 10. Reproducibility
 
-### Stage 7 打包工件并生成 Report Bundle
+### 10.1 Project Structure Overview
 
-最后，流水线会把本次运行中产生的所有关键输出，包括日志文件、原始和聚合的 CSV 文件、所有图像以及必要的元数据路径，汇总成一个自描述的“报告束”，也就是 Report Bundle。这一步不会再计算新的数值，而是在做一次系统性的整理，将本次实验的所有成果以及它们的存放位置固定下来，用一个唯一的标识符来引用，例如 `Report Bundle (20251215_194002)`。
+Project Structure Tree
 
-通过这一阶段，读者和评审可以在不依赖作者记忆的前提下，准确地找到本次实验所用的数据、生成的索引、记录的结果和输出的图像。报告中引用任何具体文件路径时，都可以回溯到这个 Bundle 中的清单。对于之后希望复现实验或做进一步扩展的人来说，Report Bundle 就是一份标准的“运行快照”，它定义了本次流水线从输入到输出的完整边界，也构成了本报告所有结论的物理基础。
+```text
+.
+.
+├── FINAL_REPORT.md                # Manually curated final report (this file can be merged here) 
+├── README.md                      # Project overview and brief description
+├── requirements.txt               # Python dependency list
+├── configs/                       # Experiment configs for each workload
+│   ├── default.yaml               # Default workload
+│   ├── exp_hotspot_fast.yaml      # hotspot fast-fast
+│   ├── exp_hotspot_slow.yaml      # hotspot slow-fast
+│   ├── exp_uniform.yaml           # uniform
+│   └── exp_zipf_s1.2.yaml         # Zipf s=1.2
+├── data/
+│   ├── get_sift1m.sh              #  (Downloaded via scripts/get_sift1m.sh) ※ actual script is in scripts/
+│   ├── sift1m/                    # SIFT1M data (base / learn / query / groundtruth) 
+│   └── siftsmall/                 # Small-scale test data
+├── scripts/
+│   ├── get_sift1m.sh              # Download and extract SIFT data
+│   ├── run_all.sh                 # Run all workloads in one shot
+│   ├── one_click.sh               # One-click: run experiments + export results
+│   ├── one_click_report.sh        # One-click: generate master report from results
+│   ├── dump_results.py            # Export COMPACT text summary from agg
+│   ├── export_report_assets.py    # Generate report_assets (tables + snippets) for each run
+│   └── validate_run.py            # Perform integrity checks for a single run
+├── src/
+│   ├── ann_engine.py              # Core execution logic for IVF + caching policies
+│   ├── policies.py                # Implementations of LRU / LFU / seconds rule and other policies
+│   ├── latency_model.py           # I/O latency model
+│   ├── experiment_runner.py       # Load configs and orchestrate experiments
+│   ├── plotting.py                # Plotting (generate figures/*.png) 
+│   ├── run_all.py                 # Backend entry point (invoked by run_all.sh/one_click.sh) 
+│   └── workload.py                # Access pattern definitions for different workloads
+├── results/
+│   ├── sr_sift_default_fast_*/            # Results for default workload (raw/agg/figures/report_assets) 
+│   ├── sr_sift_exp_hotspot_fast_fast_*/   # Results for hotspot fast-fast
+│   ├── sr_sift_exp_hotspot_slow_fast_*/   # Results for hotspot slow-fast
+│   ├── sr_sift_exp_uniform_fast_*/        # Results for uniform
+│   ├── sr_sift_exp_zipf_s1.2_fast_*/      # Results for Zipf
+│   ├── report_master_*.md                 # Automatically stitched master reports
+│   ├── log_*.txt                          # Run logs for each run
+│   ├── export_*.txt                       # Key summary for each run
+│   └── validate_*.txt                     # Validation results for each run
+└── tests/
+    ├── test_ivf_alignment.py              # IVF alignment and construction checks
+    ├── test_latency_model.py              # Unit tests for latency model
+    └── test_policies.py                   # Policy behavior tests
 
-
-
-
-太懂你在吐槽什么了 😂
-下面把第 6 节重写一版：
-*保留具体的文件名和目录结构*，但**不再出现任何 `20251215_191512` 这类具体 run id**，全部换成通用占位符。
-
----
-
-## 6. Artifact inventory（逐个文件解释：你产出了什么）
-
-本节说明 Report Bundle 里都包含哪些工件, 每一类文件放在哪里, 在报告和复现里各自起什么作用。为了让内容更通用, 所有带时间戳的目录名都用占位形式表示, 不再写死某一次运行的具体编号。
-
----
-
-### 6.1 日志文件
-
-一键流水线每运行一次, 都会在日志目录下生成一份带时间戳的日志文件。路径形式类似于:
-
-* `results/logs/one_click_<timestamp>.log`
-
-其中 `<timestamp>` 是某次运行的时间戳, 这次报告对应的那一条日志就是这类文件中的一个。
-
-这类日志文件是本次运行的完整“文字记录”, 里面包含了:
-
-* 入口脚本何时启动, 使用了什么参数
-* 各个阶段何时开始、何时结束
-* 发生错误或告警时的具体栈信息
-
-在报告中, 它一方面用来支撑“这次实验确实被完整跑过”的可复现性说明, 另一方面也为评审或后续调试提供了排错线索。
-
----
-
-### 6.2 CSV 文件
-
-CSV 是这次实验最核心的数据载体, 大致可以分成“原始结果”和“聚合结果”两种类型, 都放在以某次运行为单位的结果目录下面。每次运行的目录名类似:
-
-* `results/tiered_ann_seconds_rule_<run_id>/...`
-
-其中 `<run_id>` 是某次运行的标识符, 可以包含时间戳等内容。
-
-#### 6.2.1 原始结果 CSV
-
-每次完整运行都会在对应目录下生成一份原始结果文件, 路径形式为:
-
-* `results/tiered_ann_seconds_rule_<run_id>/raw/ann_policy_raw.csv`
-
-这一文件按“行”记录实验数据, 典型含义是“某个策略在某个 DRAM 配置下的一次测量结果”。常见列包括:
-
-* 使用的策略名称, 例如 Seconds-Rule, LRU, LFU
-* DRAM 容量配置, 例如以比例或绝对大小表示
-* 召回指标, 如 `recall@k`
-* 延迟指标, 如 p50、p95 等
-* SSD I/O 次数或字节数
-* DRAM 与 SSD 之间的迁移字节数
-
-确切列名可以通过读取 CSV 并查看 `df.columns` 得到。
-这些原始 CSV 是后面所有聚合与绘图的基础, 也是出现异常时回溯到“每次查询到底发生了什么”的唯一数据源。如果某个策略或某个容量点在原始文件中缺失, 对应的曲线和聚合结果自然也会不完整。
-
-#### 6.2.2 聚合结果 CSV
-
-在同一 `<run_id>` 目录下, 流水线会从 `raw/ann_policy_raw.csv` 出发做一次聚合, 把“细粒度记录”转换成“每个策略每个容量的一组统计指标”。聚合结果主要有两类:
-
-* 策略聚合表
-
-  * `results/tiered_ann_seconds_rule_<run_id>/agg/ann_policy_agg.csv`
-
-  这类文件按策略、DRAM 容量等键进行分组, 每一行代表一个“策略 × 容量”的整体表现, 通常包含: 平均延迟、p95 延迟、平均 I/O 放大量、总迁移字节数、平均召回率等。
-  报告中关于“某策略在某个 DRAM 预算下表现如何”的所有文字描述, 都可以在这个表中找到对应行。
-
-* 在给定 SLA 下的可达召回表
-
-  * `results/tiered_ann_seconds_rule_<run_id>/agg/sla_reachable_recall.csv`
-
-  这一文件基于聚合结果, 进一步在固定 p95 延迟约束下为每个策略挑选“召回最高的那一点”。例如, 给定某个延迟门槛, 先筛掉所有超过 SLA 的配置, 然后从剩下点里取最大召回, 写入这一表中。
-  它的作用是用一个 “SLA 视角” 把多维评价压缩成“在同一延迟约束下, 谁的召回更高”这一单一问题。
-
----
-
-### 6.3 图像文件
-
-图像文件放在各 `<run_id>` 目录下的 `figures/` 子目录中。对于每一次完成聚合的运行, 通常都会生成同样六种图像, 文件名固定, 目录结构形如:
-
-* `results/tiered_ann_seconds_rule_<run_id>/figures/io_amp_vs_dram.png`
-* `results/tiered_ann_seconds_rule_<run_id>/figures/migration_vs_dram.png`
-* `results/tiered_ann_seconds_rule_<run_id>/figures/p95_vs_dram.png`
-* `results/tiered_ann_seconds_rule_<run_id>/figures/p95_vs_iops.png`
-* `results/tiered_ann_seconds_rule_<run_id>/figures/recall_latency_frontier.png`
-* `results/tiered_ann_seconds_rule_<run_id>/figures/sla_reachable_recall.png`
-
-每一种图的语义是固定的, 与 `<run_id>` 用的是什么时间戳无关:
-
-* `p95_vs_dram.png`
-  展示 p95 延迟相对于 DRAM 容量的变化关系, 用来直观回答“DRAM 越多, 尾延迟是否整体越好”以及“在同一容量下, 哪个策略的 p95 更低”。
-
-* `io_amp_vs_dram.png`
-  展示 I/O 放大量随 DRAM 容量变化的情况, 反映“增加 DRAM 是否确实减少了对 SSD 的多余读写”, 以及“在相同 DRAM 预算下, 谁的 SSD 压力更小”。
-
-* `migration_vs_dram.png`
-  展示在不同 DRAM 容量下, 各策略为维持热集所付出的迁移数据量。通过这张图可以判断, 某个策略的好指标是不是建立在非常激进的搬迁之上, 以及 DRAM 变大之后迁移成本是否有缓和。
-
-* `p95_vs_iops.png`
-  把 p95 延迟和 I/O 压力放在同一张图里, 通常一轴是延迟, 一轴是 I/O 次数或 IOPS。它用来观察“尾延迟是否主要受 SSD 负载驱动”, 以及“在相似 I/O 压力下, 哪个策略能做到更低的 p95”。
-
-* `recall_latency_frontier.png`
-  把不同策略和容量组合的“召回–延迟”点绘制在同一平面上, 关注的是谁的前沿曲线更靠近“高召回、低延迟”的理想角落。这张图体现的是一个多目标优化的前沿, 用来比较各策略的整体权衡能力。
-
-* `sla_reachable_recall.png`
-  在固定一个或多个 p95 SLA 门槛的前提下, 展示各策略能达到的最高召回率。它提供的是一种工程视角: 如果只能接受这么高的延迟, 在所有策略中应该优先选谁。
-
-整体来看, 日志文件说明“这次实验是怎么跑的”, 原始 CSV 说明“实验一共算出了哪些细粒度数据点”, 聚合 CSV 和图像则把这些数据整理成更适合阅读和对比的形态。所有这些工件, 共同构成了本报告结论的证据基础。
-
-
-## 7. Results interpretation guide (怎么写 results + 偏差怎么量化)
-
-> Important: I cannot see the numeric values inside your CSVs from within this chat.  
-> So this section gives you an exact, reproducible method to extract the key numbers and write crisp conclusions.
-
-### 7.1 Print columns + preview (第一步：看 CSV 里到底有哪些列)
-Run from repo root:
-
-```bash
-python - <<'PY'
-import pandas as pd
-
-path = "results/tiered_ann_seconds_rule_20251215_193936/agg/ann_policy_agg.csv"
-df = pd.read_csv(path)
-
-print("Columns:", list(df.columns))
-print(df.head(10).to_string(index=False))
-PY
 ```
 
-This tells you:
-- what metric names are available
-- how policies are labeled
-- what DRAM budget column is called (e.g., `dram_frac`, `dram_budget`, etc.)
+## 11. Conclusion
+To sum up, this project, on a fixed IVF ANN engine, changes only the dimension of which IVF lists are placed in DRAM and which are placed in SSD, and systematically reveals the limits of what tiered caching can achieve: once a query falls onto SSD, p95 is basically determined by how many pages are read, IOAmp is the key intermediate metric for understanding latency, and nprobe is still the most crucial recall–latency knob; 
 
-### 7.2 Core expected trends (你写 results 时应该先写“预期趋势”)
-You can copy this structure directly into your paper:
+Under different workloads, no policy is absolutely better or worse——when hotspots change quickly, seconds rule / LRU have the strongest adaptability and can significantly push down IOAmp, but at the cost of GB-level migration overhead, whereas in more “mild” scenarios such as default, slow hotspot, Zipf, and uniform, window LFU achieves almost the same p95 with a clearly smaller migration cost, and is therefore a more reliable default choice in engineering practice; 
 
-1) Trend 1: latency should drop with more DRAM  
-   - Expected: p95 is (mostly) monotonic decreasing with DRAM.  
-   - Deviation: non-monotonicity indicates measurement noise, workload phase changes, or thrashing (often for recency-only policies).
-
-2) Trend 2: I/O amplification should drop with more DRAM  
-   - Expected: fewer SSD-resident lists are accessed.  
-   - Deviation: if not decreasing, the policy may be caching the wrong lists.
-
-3) Trend 3: migration overhead increases when policy is “too reactive”  
-   - Expected: LRU-like policies can churn; LFU-like policies are stable.  
-   - Deviation: if seconds-rule churns more than LRU, the scoring/tuning is wrong.
-
-### 7.3 Quantifying deviation (可直接抄进报告的方法)
-Below are three quantitative deviation measures. Pick at least one (paper needs at least one).
-
-#### (A) Monotonicity violation rate
-Example for p95 vs DRAM:
-
-```bash
-python - <<'PY'
-import pandas as pd
-import numpy as np
-
-path = "results/tiered_ann_seconds_rule_20251215_193936/agg/ann_policy_agg.csv"
-df = pd.read_csv(path)
-
-# - edit these to match your CSV column names -
-POLICY = "policy"
-DRAM   = "dram_frac"      # or dram_budget
-P95    = "p95_us"         # or p95_ms
-# --
-
-for pol, g in df.groupby(POLICY):
-    g = g.sort_values(DRAM)
-    p = g[P95].to_numpy()
-    # violation count: any increase when DRAM increases
-    violations = np.sum(np.diff(p) > 0)
-    total = max(len(p) - 1, 1)
-    print(f"{pol:20s} monotonicity violations: {violations}/{total} = {violations/total:.2%}")
-PY
-```
-
-This yields a clear “偏差有多大” number.
-
-#### (B) Gap-to-All-DRAM (how far from best possible)
-At each DRAM budget, compare policy latency to All-DRAM:
-
-\[
-\text{gap}(b) = \frac{p95_{\text{policy}}(b)}{p95_{\text{all-dram}}(b)} - 1
-\]
-
-You can report average gap across budgets, or the max gap.
-
-#### (C) SLA-reachable recall difference
-For a given SLA (e.g., 2ms p95), report:
-
-\[
-\Delta \text{recall} = \text{recall}_{\text{seconds-rule}} - \text{recall}_{\text{baseline}}
-\]
-
-Use `sla_reachable_recall.csv` to read it directly.
-
-### 7.4 How to write “Results” section (模板)
-Use exactly this structure:
-
-- Figure X: what the axes mean  
-- Expected: what should happen and why  
-- Observed: what your data shows (one sentence, with a number)  
-- Explanation: why this happened (mechanism, not feelings)  
-- Takeaway: one sentence conclusion
-
-Example template:
-
-> Fig. 2 (p95 vs DRAM) shows how tail latency changes when we increase DRAM budget.  
-> Expected: p95 should decrease as DRAM increases because fewer probed lists require SSD I/O.  
-> Observed: At 20% DRAM, Seconds-Rule reduces p95 by X% compared to LRU and by Y% compared to LFU, while remaining within Z of All-DRAM.  
-> Explanation: Seconds-Rule combines interval and idle, adapting faster than LFU but with less churn than LRU.  
-> Takeaway: Seconds-Rule achieves a better tail-latency/DRAM trade-off in this workload.
-
-Replace X/Y/Z using the scripts above.
-
-
-
-## 8. Final “paper-style” results section with your actual figures embedded
-
-Below I embed the latest aggregated run (20251215_193936) figures using relative paths.  
-If you keep this report in repo root, the images should render in Markdown viewers.
-
-### 8.1 Tail latency vs DRAM
-Figure 1. p95 latency vs DRAM budget.
-![](results/tiered_ann_seconds_rule_20251215_193936/figures/p95_vs_dram.png)
-
-### 8.2 I/O amplification vs DRAM
-Figure 2. I/O amplification vs DRAM budget.
-![](results/tiered_ann_seconds_rule_20251215_193936/figures/io_amp_vs_dram.png)
-
-### 8.3 Migration overhead vs DRAM
-Figure 3. Migration bytes vs DRAM budget.
-![](results/tiered_ann_seconds_rule_20251215_193936/figures/migration_vs_dram.png)
-
-### 8.4 Tail latency vs IOPS
-Figure 4. p95 latency vs SSD IOPS.
-![](results/tiered_ann_seconds_rule_20251215_193936/figures/p95_vs_iops.png)
-
-### 8.5 Recall-latency frontier
-Figure 5. Recall-latency frontier (higher recall, lower latency is better).
-![](results/tiered_ann_seconds_rule_20251215_193936/figures/recall_latency_frontier.png)
-
-### 8.6 SLA reachable recall
-Figure 6. SLA-reachable recall.
-![](results/tiered_ann_seconds_rule_20251215_193936/figures/sla_reachable_recall.png)
-
-> If you also want to include Run A (20251215_192741) as a second workload/dataset, copy Section 8 and change the directory name.
-
-
-
-## 9. Threats to validity (为什么可能不准：偏差来源)
-
-A clear paper must explain what could make results differ in the real world.
-
-### 9.1 Simulator vs real system gap
-If latency is modeled (instead of measured on real SSD), then:
-- queueing effects (IO depth), OS page cache, and tail amplification may be simplified.
-
-Mitigation in report: clearly state your latency model and assumptions.
-
-### 9.2 Workload realism
-If workloads are synthetic:
-- a different real trace may change policy ranking.
-
-Mitigation: include at least two workloads (you already have two aggregated runs).
-
-### 9.3 Parameter sensitivity
-Seconds-Rule depends on \(\lambda\), EWMA smoothing, rebalance interval, and DRAM budget.
-
-Mitigation: report sensitivity for \(\lambda\) or window size if available in your sweep.
-
-
-
-## 10. Conclusion (一段话总结你贡献了什么)
-
-This project contributes:
-
-1) A reproducible evaluation pipeline for tiered ANN policies (one-click execution + artifacts).
-2) A seconds-scale tiering policy that unifies recency and frequency into an interpretable scoring function.
-3) A standardized set of metrics and plots (p95/I/O/migration/frontier/SLA) for comparing policies.
-
-The generated results and figures provide the evidence needed to analyze trade-offs between recall, tail latency, SSD I/O pressure, and migration overhead in hybrid DRAM+SSD vector search.
-
-
-
-## References (paper-format)
-[1] J. Gray and G. R. Putzolu, “The 5 Minute Rule for Trading Memory for Disk Accesses and The 10 Byte Rule for Trading Memory for CPU Time,” SIGMOD 1987.  
-[2] G. Graefe, “(Five-minute rule revisits under flash memory),” DaMoN 2007 (flash memory variant of five-minute rule).  
-[3] T. Zhang et al., “From Minutes to Seconds: Redefining the Five-Minute Rule for AI-Era Memory Hierarchies,” arXiv, 2025.  
-[4] J. Johnson, M. Douze, and H. Jégou, “Billion-scale similarity search with GPUs,” arXiv:1702.08734, 2017.  
-[5] H. Jégou, M. Douze, and J. Johnson, “Faiss: A library for efficient similarity search,” Engineering at Meta, 2017.  
-[6] Faiss documentation: IVF / IndexIVF reference.  
-[7] S. Jayaram Subramanya et al., “DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node,” NeurIPS 2019 (Microsoft Research publication page).  
-[8] Q. Chen et al., “SPANN: Highly-efficient Billion-scale Approximate Nearest Neighbor Search,” NeurIPS 2021.
-
-
-
-## Appendix A - Submission checklist (给你最后交作业用)
-- [ ] Repo contains this report (`FINAL_REPORT.md` or PDF) at root or in `report/`.
-- [ ] One-click script runs successfully from a clean environment.
-- [ ] `results/logs/` contains the log referenced in Section 1.
-- [ ] All 6 plots for the main run are present and referenced by relative paths.
-- [ ] Report includes: background, problem statement, design, baselines, evaluation, results, limitations, references.
-- [ ] (If required) GitHub link + commit hash recorded in report.
-
-
-
-## Appendix B - How to cover *every* source-code file (逐个源代码文件说明的方法)
-
-你在问题里强调“每个阶段、每个文件、每个步骤都要解释”。  
-本报告已经对 Report Bundle 中列出的所有产物文件（log/CSV/PNG） 做了逐文件解释（Section 6），但如果你希望把 仓库里的每一个源代码文件 都纳入“论文式附录”，最可靠的方法是让附录 自动从你的真实仓库生成（避免我在聊天里凭空猜文件名）。
-
-### B.1 生成自动附录（1 条命令）
-我附带了一个零依赖脚本：`tools_generate_repo_inventory.py`（见本聊天附件/下载）。
-
-把它放到你的 repo 根目录，然后运行：
-
-```bash
-python tools_generate_repo_inventory.py
-```
-
-它会生成：
-
-- `appendix_repo_inventory.md`
-
-里面是一个 Markdown 表格：逐文件列出路径、类型、以及（对 Python 文件）模块 docstring/顶层函数类名摘要。
-
-### B.2 如何把它并入最终报告
-- 方式 1：把 `appendix_repo_inventory.md` 直接作为提交的一部分（推荐，最简单）。
-- 方式 2：把该文件内容复制粘贴到你的最终 PDF/Word 报告的 Appendix 部分。
-
-> 这样可以实现你要求的“每个文件都解释”，而且保证 100% 与你真实 repo 对齐。
-
-
-
-## Appendix C - Auto-fill “偏差有多大”的关键数字（建议必做）
-
-我另外附带了一个脚本：`tools_summarize_results.py`，它会从你的 `agg/ann_policy_agg.csv` 自动提取：
-- 策略数量、DRAM budget 点数
-- p95 vs DRAM 的单调性违背率（偏差量化）
-- （如果能识别到 All-DRAM）avg gap-to-oracle
-- `sla_reachable_recall.csv` 是否存在、以及列名
-
-### C.1 用法（1 条命令）
-从 repo root 运行（把 RUN_DIR 换成你要写进报告的那次 run）：
-
-```bash
-python tools_summarize_results.py results/tiered_ann_seconds_rule_20251215_193936
-```
-
-它会生成：
-- `report_snippet.md`（可直接粘贴到你的 Results 里）
-
-> 这一步做完，你的 report 就会从“有图”升级到“有可复现的量化结论”。
-
+The experiments also show that under the current page-level I/O model and parameters, it is difficult to achieve an SLA in the 200–500µs range in a hybrid DRAM+SSD setting by merely adding DRAM and tuning caching policies, and to truly push tail latency back into the sub-millisecond range, we must also start from 「reducing the SSD bytes that must be touched per miss」, for example by introducing PQ compression, finer-grained caching units, or stronger routing structures, all of which provide a clear and reproducible experimental baseline for subsequent system design
