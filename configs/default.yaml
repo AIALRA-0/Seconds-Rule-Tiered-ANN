@@ -1,0 +1,86 @@
+project:
+  results_root: "results"
+  run_name: "tiered_ann_seconds_rule"
+
+data:
+  dataset: "sift1m"          # "sift1m" or "synthetic"
+  sift1m_dir: "data/sift1m"  # include sift_base.fvecs / sift_query.fvecs
+  num_base: 100000
+  num_queries: 1000
+  dim: 32                    # used for synthetic; for sift1m, dim=128 is automatically read from file
+  query_shuffle: true        # to introduce variance across multiple seeds: randomly shuffle query order
+  query_sample_without_replacement: true
+
+index:
+  type: "ivf_flat"
+  metric: "l2"
+  k: 10
+  nlist: 64
+  nprobe_candidates: [1, 2, 4, 8, 16, 32]
+  faiss_num_threads: 4
+  train_seed: 1234
+
+tier:
+  page_size_bytes: 4096      # 4KB pages; you can also change it to 16384
+  dram_access_us_per_list: 0.2
+  ssd_base_lat_us_per_page: 20.0
+
+  # sweep dimensions
+  dram_fraction_list: [0.05, 0.1, 0.2]
+  max_iops_list: [1000000, 5000000, 10000000]
+
+  # whether to count migration cost into DRAM (write-back); by default all are counted (for an upper bound)
+  migration_count_eviction: true
+
+policy:
+  enabled_policies:
+    - "all_dram"
+    - "all_ssd"
+    - "naive_lfu"
+    - "lru"
+    - "window_lfu"
+    - "seconds_rule"
+
+  rebalance_interval: 200
+
+  window_lfu:
+    window_size_queries: 5000
+
+  seconds_rule:
+    alpha: 0.1
+    recency_weight: 0.3
+
+    # T* Use seconds as the common intuitive unit, then map it to the query interval (t_star_queries).
+    t_star_seconds: 3.0
+    assumed_qps_for_tstar: 10000.0
+
+experiment:
+  seeds: [0, 1, 2]
+  slas_us: [200.0, 500.0]
+
+  # output index
+  export_metrics:
+    - "avg_latency_us"
+    - "p50_latency_us"
+    - "p95_latency_us"
+    - "p99_latency_us"
+    - "qps_from_avg_latency"
+    - "avg_ssd_pages"
+    - "avg_ssd_bytes"
+    - "avg_io_amplification"
+    - "total_migration_bytes"
+    - "migration_bytes_per_query"
+    - "avg_migrated_clusters_per_rebalance"
+    - "total_migration_time_us"
+    - "migration_time_us_per_query"
+
+plot:
+  enable: true
+  errorbar: "ci95"    # "std" or "ci95"
+  figures:
+    - "p95_vs_dram"
+    - "p95_vs_iops"
+    - "io_amp_vs_dram"
+    - "migration_vs_dram"
+    - "sla_reachable_recall"
+    - "recall_latency_frontier"

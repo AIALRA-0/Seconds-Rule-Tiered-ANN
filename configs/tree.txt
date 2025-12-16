@@ -1,0 +1,6 @@
+configs/
+├── default.yaml
+└── tree.txt
+
+default.yaml:
+- All configurable parameters for the project (data, index, tier, policy, sweep, plot, seed) are all written here.

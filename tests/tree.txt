@@ -1,0 +1,11 @@
+tests/
+├── tree.txt
+├── test_latency_model.py
+├── test_policies.py
+└── test_ivf_alignment.py
+
+These tests ensure:
+
+- max_iops must affect latency (otherwise the sweep is meaningless)
+- Naive initialization must satisfy the DRAM budget (bug fix)
+- IVF quantizer outputs list IDs with the correct range and shape (aligned with IVF)

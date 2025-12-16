@@ -1,0 +1,17 @@
+scripts/
+├── run_all.sh
+├── get_sift1m.sh
+├── update_tree.sh
+└── tree.txt
+
+run_all.sh:
+
+- One-click: create virtual environment -> install dependencies -> check data -> run experiments -> aggregate -> generate figures
+
+get_sift1m.sh:
+
+- Only performs path checking and messaging (to avoid data copyright issues)
+
+update_tree.sh:
+
+- Optional: use the tree command to update each directory's tree.txt

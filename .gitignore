@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+# large / generated
+data/
+results/
+
+# editor
+.vscode/
+.idea/
+.DS_Store

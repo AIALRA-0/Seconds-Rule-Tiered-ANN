@@ -1,0 +1,25 @@
+src/
+├── **init**.py
+├── tree.txt
+├── config.py
+├── utils.py
+├── dataset.py
+├── dataset_sift1m.py
+├── groundtruth.py
+├── workload.py
+├── ann_engine.py
+├── latency_model.py
+├── policies.py
+├── experiment_runner.py
+├── sweeps.py
+├── plotting.py
+└── run_all.py
+
+Core pipeline:
+
+- ann_engine.py: build IVF index + use quantizer to produce list IDs (aligned with IVF)
+- policies.py: baselines + seconds-rule
+- experiment_runner.py: given nprobe & tier config, run “policy simulation” and output metrics
+- sweeps.py: parameter sweep + multi-seed aggregation + SLA → reachable recall
+- plotting.py: unified plotting (with error bars)
+- run_all.py: one-click entry point

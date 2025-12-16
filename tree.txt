@@ -1,0 +1,34 @@
+Seconds-Rule-Tiered-ANN/
+├── README.md                  # Project description (you can reuse your original README structure)
+├── tree.txt                   # Root directory structure description (this file)
+├── requirements.txt           # Python dependencies
+├── .gitignore                 # Ignore data/ results/ .venv/
+├── configs/
+│   ├── default.yaml           # Unified config: all tunable parameters are here
+│   └── tree.txt
+├── scripts/
+│   ├── run_all.sh             # One-click: reproduce experiments + generate figures
+│   ├── get_sift1m.sh          # Data preparation helper script (no forced download; path checking and hints)
+│   ├── update_tree.sh         # Generate/update tree.txt (optional)
+│   └── tree.txt
+├── src/
+│   ├── __init__.py
+│   ├── tree.txt
+│   ├── config.py              # Load YAML config + dataclasses
+│   ├── utils.py               # Common utilities: stats, percentile, seed, paths
+│   ├── dataset.py             # Synthetic data
+│   ├── dataset_sift1m.py      # Load SIFT1M (fvecs)
+│   ├── groundtruth.py         # Ground truth + recall@k
+│   ├── workload.py            # Synthetic cluster/workload (hotspot drift, etc.)
+│   ├── ann_engine.py          # Build IVF, use quantizer to get list IDs and list sizes
+│   ├── latency_model.py       # Latency model (max_iops has real impact on results)
+│   ├── policies.py            # All policies: AllDRAM/AllSSD/LRU/WindowLFU/NaiveLFU/SecondsRule
+│   ├── experiment_runner.py   # Core: run one nprobe and output all metrics (including IO amp + migration)
+│   ├── sweeps.py              # Sweep & multi-seed aggregation & SLA reachable recall
+│   ├── plotting.py            # Unified plotting (error bars/CI)
+│   └── run_all.py             # Unified entry: run sweep -> aggregate -> SLA -> plot
+└── tests/
+    ├── tree.txt
+    ├── test_latency_model.py
+    ├── test_policies.py
+    └── test_ivf_alignment.py
