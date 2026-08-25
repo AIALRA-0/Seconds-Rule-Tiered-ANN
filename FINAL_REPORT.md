@@ -1,6 +1,6 @@
 # Evaluating Caching Policies for IVF-based ANN Engines under Tiered DRAM and SSD Storage
 
-### Lucas Ding
+### AIALRA-0 Contributors
 
 ## 1. Abstract
 

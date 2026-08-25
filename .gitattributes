@@ -1,0 +1,9 @@
+*.md text eol=lf
+FINAL_REPORT.md -text
+*.py text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.svg text eol=lf
+*.png binary
+*.pdf binary
